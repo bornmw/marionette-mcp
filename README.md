@@ -1,0 +1,126 @@
+# marionette-mcp
+
+Zero-dependency [Model Context Protocol](https://modelcontextprotocol.io) server that drives **your own Firefox** — the instance *you* launched with `--marionette` — via its native wire protocol.
+
+AI agents get a precise DOM actuator: snapshot the interactive elements of a page, then click, type, select, toggle checkboxes, upload files, wait for conditions, run JS, and screenshot — all against the browser session you control (your profile, your logins, your kill switch).
+
+## Why not Playwright/CDP?
+
+Playwright's browser-automation channels (CDP, extension mode) target Chromium, or force *the library* to launch and own a pinned browser build. Marionette is different:
+
+* **You own the browser.** Firefox starts manually, in whatever profile you chose. The MCP server only *attaches* over loopback TCP (default port 2828). Nothing in this repo launches, downloads, or upgrades a browser.
+* **Zero dependencies.** No `npm install` of runtime deps, no browser downloads, no CDP shim. One Node runtime (>= 20) plus your existing Firefox.
+* **Native protocol.** Frames are length-prefixed JSON over TCP — the same protocol Selenium's Firefox driver speaks. No protocol translation, no version drift.
+
+## Architecture
+
+```
+ AI agent (e.g. opencode)
+        │  stdio · newline-delimited JSON-RPC 2.0
+        ▼
+ marionette-mcp (src/server.mjs)          ── tools: fx_* (18)
+        │  loopback TCP · <byteLen>:<json> frames
+        ▼
+ your Firefox (firefox --marionette)      ── your profile, your cookies
+```
+
+* `src/protocol.mjs` — pure wire codec (frame encode/parse, element-ref unwrap). No I/O, fully unit-tested.
+* `src/marionette.mjs` — async Marionette client (one socket, one session, pending-command map).
+* `src/server.mjs` — MCP stdio server + tool implementations.
+
+### Design notes (bugs that cost real debugging time)
+
+* **Frames are pure ASCII.** `JSON.stringify` does not escape `U+E000`/`U+E001` (W3C file markers) or any char ≥ `0x7F`; in UTF-8 those are multi-byte, while the length prefix is computed from string length. That desynchronizes the stream for the rest of the connection. Every frame is `\uXXXX`-escaped so declared length always equals actual bytes (regression-tested).
+* **Element refs are unwrapped.** `FindElement` replies wrap the uuid (`{ "element-…": "uuid" }`); subsequent commands (`ElementClick`, `ElementSendKeys`, …) take the *bare* uuid.
+* **File uploads use the raw absolute path** in `ElementSendKeys` — this protocol generation has no W3C base64 file encoding (those codepoints are the legacy Selenium `NULL`/`CANCEL` keys there).
+* **Script bodies must `return`.** W3C `ExecuteScript` bodies are function *bodies*: a bare expression statement evaluates and is discarded.
+* Marionette keeps a **persistent session across reconnects**; a crashed automation client can leave stale session state — relaunch the browser if commands queue forever.
+
+## Quick start
+
+```bash
+# 1. Launch Firefox with Marionette enabled (dedicated profile recommended)
+firefox --marionette
+
+# 2. Point the MCP client (opencode) at the server
+node scripts/e2e-live.mjs        # optional: live smoke test
+```
+
+opencode config (opencode.json):
+
+```jsonc
+{
+  "mcp": {
+    "marionette": {
+      "type": "local",
+      "command": ["node", "/absolute/path/to/marionette-mcp/src/server.mjs"],
+      "environment": {
+        "FX_MARIONETTE_PORT": "2828",
+        "FX_MCP_FILE_ROOTS": "/tmp,/your/projects"
+      },
+      "enabled": true
+    }
+  }
+}
+```
+
+Then the `fx_*` tools are available in-session. Typical flow:
+
+1. `fx_navigate` to the page
+2. `fx_snapshot` → numbered map of interactive elements (refs)
+3. `fx_click` / `fx_type` / `fx_select` / `fx_toggle` / `fx_upload` by `ref` (or CSS `selector`)
+4. `fx_wait` for the next state; `fx_screenshot` + your own vision pass to verify what the DOM can't
+
+## Tools
+
+| Tool | Purpose |
+|---|---|
+| `fx_status` | Connection, session, current page, `navigator.webdriver` |
+| `fx_navigate` | Go to a URL |
+| `fx_page` | Current URL + title |
+| `fx_snapshot` | Interactive-element map with refs |
+| `fx_click` | Click (ref or selector) |
+| `fx_type` | Type text (clears first unless `keep: true`) |
+| `fx_select` | Set `<select>` by option value or label |
+| `fx_toggle` | Set checkbox/radio state |
+| `fx_upload` | Set file input (raw path, must be under `FX_MCP_FILE_ROOTS`) |
+| `fx_eval` | Run JS in the page (function body; `return` your value) |
+| `fx_wait` | Wait for visible text or CSS selector (≤ 30 s) |
+| `fx_screenshot` | Save PNG under an allowed root |
+| `fx_windows` / `fx_window` | List / switch windows |
+| `fx_alert_state` / `fx_alert_accept` / `fx_alert_dismiss` | Native dialogs |
+| `fx_cookies` | Current-origin cookies (names/domains only) |
+
+## Environment
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `FX_MARIONETTE_HOST` | `127.0.0.1` | Marionette endpoint (loopback only, by design) |
+| `FX_MARIONETTE_PORT` | `2828` | Firefox's `--marionette` port |
+| `FX_MCP_FILE_ROOTS` | `/tmp` | Comma-separated roots that `fx_upload`/`fx_screenshot` may touch |
+
+## Security
+
+* **Loopback only.** The client connects to `127.0.0.1` — there is deliberately no network path.
+* **File access is rooted.** Uploads and screenshots reject paths outside `FX_MCP_FILE_ROOTS`.
+* **Use a dedicated profile** for automation, and keep the browser visible: a human-in-the-loop is the expected model, not headless stealth. Native OS dialogs (e.g. the file picker) and CAPTCHAs are *not* automatable by design — stop and let the human handle them.
+
+## Testing
+
+Zero-dependency test suite (built-in `node:test`):
+
+```bash
+npm test            # or: node --test test/
+```
+
+* `test/protocol.test.mjs` — frame codec, parser resilience, element-ref unwrapping (pure unit tests).
+* `test/marionette.test.mjs` — the real client against an in-process fake Marionette server that verifies every frame's byte integrity (non-ASCII payloads included).
+* `test/server.test.mjs` — spawns the real MCP server and drives it end-to-end (JSON-RPC plumbing, all tool paths, framing-safety under Unicode input, stdin-EOF shutdown).
+
+`npm run e2e:live` additionally exercises a real `firefox --marionette` you start yourself.
+
+CI: `.github/workflows/ci.yml` — syntax check + full test suite across Node 20/22/24.
+
+## License
+
+GPL-2.0 (see `LICENSE`).

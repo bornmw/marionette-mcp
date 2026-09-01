@@ -1,0 +1,26 @@
+name: CI
+on: [push, pull_request]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: ['20', '22', '24']
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+
+      - name: Syntax check
+        run: |
+          node --check src/protocol.mjs
+          node --check src/marionette.mjs
+          node --check src/server.mjs
+
+      - name: Run tests
+        run: node --test test/protocol.test.mjs test/marionette.test.mjs test/server.test.mjs
