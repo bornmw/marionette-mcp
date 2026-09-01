@@ -36,7 +36,7 @@ function resolveElRef(args) {
     delete p.ref;
   }
   if (!p.using || !p.value) {
-    if (p.selector) { p.value = p.selector; p.using = p.using || 'css'; }
+    if (p.selector) { p.value = p.selector; p.using = p.using || 'css selector'; }
     else throw new Error('need ref (from fx_snapshot) or selector');
     delete p.selector;
   }

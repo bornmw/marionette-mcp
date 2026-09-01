@@ -123,6 +123,14 @@ test('fx_click resolves refs through FindElement (W3C ref unwrap)', async () => 
   assert.equal(f[3].using, 'xpath');
 });
 
+test('fx_click with CSS selector uses W3C "css selector" using-value', async () => {
+  const r = await rpc({ jsonrpc: '2.0', id: 19, method: 'tools/call', params: { name: 'fx_click', arguments: { selector: '#searchFilter_salaryBucketV2' } } });
+  assert.match(toolText(r), /"ok": true/);
+  const f = [...fake.state.frames].reverse().find((x) => x[2] === 'WebDriver:FindElement');
+  assert.equal(f[3].using, 'css selector', 'gecko rejects bare "css" as a using-value');
+  assert.equal(f[3].value, '#searchFilter_salaryBucketV2');
+});
+
 test('fx_type sends clear+keys and stays framing-safe with unicode', async () => {
   await rpc({ jsonrpc: '2.0', id: 9, method: 'tools/call', params: { name: 'fx_snapshot', arguments: {} } });
   const text = 'Jürgen 🎯\ue000';
