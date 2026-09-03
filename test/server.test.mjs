@@ -89,6 +89,15 @@ test('tools/list exposes the full tool table', async () => {
     assert.equal(t.inputSchema.type, 'object');
     assert.equal(t.inputSchema.additionalProperties, false);
   }
+  const fe = r.result.tools.find((t) => t.name === 'fx_eval');
+  assert.equal(fe.inputSchema.properties.wait_ms.type, 'number', 'fx_eval.wait_ms (Promise await)');
+  assert.match(fe.description, /awaited/);
+  const fs = r.result.tools.find((t) => t.name === 'fx_screenshot');
+  assert.match(fs.description, /full-page/i);
+  const ff = r.result.tools.find((t) => t.name === 'fx_form');
+  assert.match(ff.description, /groups/i, 'fx_form documents choice-group aggregation');
+  const fa = r.result.tools.find((t) => t.name === 'fx_answer');
+  assert.match(fa.description, /toggle cycle/);
 });
 
 test('fx_status reaches the browser through the fake', async () => {
@@ -139,6 +148,46 @@ test('fx_type sends clear+keys and stays framing-safe with unicode', async () =>
   assert.deepEqual(fake.state.violations, [], 'unicode typing must not desync framing: ' + JSON.stringify(fake.state.violations));
   const keys = [...fake.state.frames].reverse().find((x) => x[2] === 'WebDriver:ElementSendKeys');
   assert.equal(keys[3].text, text);
+});
+
+test('fx_click rewrites a digit-leading #id selector to [id="…"]', async () => {
+  const r = await rpc({ jsonrpc: '2.0', id: 20, method: 'tools/call', params: { name: 'fx_click', arguments: { selector: '#56d78818-a3c3-4010-ad4c-c03bf11a09bf' } } });
+  const t = toolText(r);
+  const f = [...fake.state.frames].reverse().find((x) => x[2] === 'WebDriver:FindElement');
+  assert.equal(f[3].value, '[id="56d78818-a3c3-4010-ad4c-c03bf11a09bf"]', 'digit-leading id must reach the driver in attr form');
+  assert.match(t, /"used": "\[id=/);
+});
+
+test('fx_click keeps a valid #id selector untouched', async () => {
+  const r = await rpc({ jsonrpc: '2.0', id: 21, method: 'tools/call', params: { name: 'fx_click', arguments: { selector: '#searchFilter_salaryBucketV2' } } });
+  toolText(r);
+  const f = [...fake.state.frames].reverse().find((x) => x[2] === 'WebDriver:FindElement');
+  assert.equal(f[3].value, '#searchFilter_salaryBucketV2');
+});
+
+test('fx_click rejects unsupported CSS (:has) with an actionable hint', async () => {
+  const r = await rpc({ jsonrpc: '2.0', id: 22, method: 'tools/call', params: { name: 'fx_click', arguments: { selector: 'form button:has(> span)' } } });
+  const t = toolErr(r, /CSS selector rejected/);
+  assert.match(t, /:has\(\) is not supported/);
+});
+
+test('fx_eval awaits a Promise-returning body via the two-phase protocol', async () => {
+  fake.state.mode = 'evalok';
+  fake.state.pollCount = 0;
+  const r = await rpc({ jsonrpc: '2.0', id: 23, method: 'tools/call', params: { name: 'fx_eval', arguments: { js: 'return (async () => { await new Promise((rr) => setTimeout(rr, 5)); return 42; })();' } } });
+  const t = toolText(r);
+  assert.match(t, /"r": 42/);
+  assert.match(t, /"awaited": true/);
+  const evals = fake.state.frames.filter((f) => f[2] === 'WebDriver:ExecuteScript');
+  assert.ok(evals.some((f) => String(f[3].script).includes('__fxeval__')), 'wrapper frame sent');
+  assert.ok(evals.some((f) => String(f[3].script).includes('__fxpoll__')), 'poll frame sent');
+});
+
+test('fx_eval errors with a clear message when the Promise never settles', async () => {
+  fake.state.mode = 'evalhanging';
+  fake.state.pollCount = 0;
+  const r = await rpc({ jsonrpc: '2.0', id: 24, method: 'tools/call', params: { name: 'fx_eval', arguments: { js: 'return new Promise(() => {});', wait_ms: 400 } } });
+  toolErr(r, /did not settle within 400 ms/);
 });
 
 test('fx_upload rejects paths outside allowed roots', async () => {

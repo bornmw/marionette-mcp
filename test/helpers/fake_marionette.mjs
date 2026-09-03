@@ -45,7 +45,7 @@ export function startFakeMarionette() {
         state.frames.push(msg);
         const [, id, name, params] = msg;
         try {
-          const reply = JSON.stringify(respond(id, name, params));
+          const reply = JSON.stringify(respond(id, name, params, state));
           for (const ch of reply) if (ch.charCodeAt(0) > 0x7f) throw new Error('fake reply not ascii');
           sock.write(Buffer.from(reply.length + ':' + reply, 'ascii'));
         } catch (e) {
@@ -69,7 +69,7 @@ export function startFakeMarionette() {
   });
 }
 
-function respond(id, name, params) {
+function respond(id, name, params, state) {
   switch (name) {
     case 'WebDriver:NewSession':
       return [1, id, null, { sessionId: 'fake-sess-1', capabilities: { browserName: 'firefox' } }];
@@ -90,6 +90,21 @@ function respond(id, name, params) {
     case 'WebDriver:DismissAlert': return [1, id, null, {}];
     case 'WebDriver:ExecuteScript': {
       const s = String(params && params.script || '');
+      // fx_eval two-phase: the wrapper (sentinel __fxeval__) always reports the
+      // body's Promise as pending; the poll (sentinel __fxpoll__) settles per
+      // test mode: 'evalok' settles on the first poll, anything else never does.
+      if (s.includes('__fxeval__')) return [1, id, null, { value: { __fx: 'pend' } }];
+      if (s.includes('__fxpoll__')) {
+        state.pollCount = (state.pollCount || 0) + 1;
+        if (state.mode === 'evalok' && state.pollCount === 1) return [1, id, null, { value: { __fx: 'ok', v: 42 } }];
+        return [1, id, null, { value: null }];
+      }
+      // in-page CSS validation (sentinel __csscheck__): reject :has()
+      if (s.includes('__csscheck__')) {
+        const sel = String((params && params.args && params.args[0]) || '');
+        if (sel.includes(':has(')) return [1, id, null, { value: 'bad:SyntaxError: (fake) unsupported selector syntax' }];
+        return [1, id, null, { value: 'ok' }];
+      }
       if (s.includes('JSON.stringify({webdriver')) {
         const v = JSON.stringify({ webdriver: false, url: 'https://fake.test/', title: 'Fake Page', ready: 'complete' });
         return [1, id, null, { value: v }];

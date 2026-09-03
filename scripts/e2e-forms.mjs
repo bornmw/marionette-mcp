@@ -43,16 +43,23 @@ textarea,input,select{padding:6px 8px;border:1px solid #9ca3af;border-radius:6px
 <label>Full Name<input id="name" type="text" placeholder="your name"></label>
 <label>Work Email<input id="email" type="email" placeholder="a@b.c"></label>
 <label>Password<input id="pw" type="password"></label>
-<label>Role<select id="role">
-<option value="j1">Junior</option><option value="s1">Senior</option><option value="st1">Staff</option>
-</select></label>
-<label>Notes<textarea id="notes" rows="2"></textarea></label>
+ <label>Role<select id="role">
+ <option value="j1">Junior</option><option value="s1">Senior</option><option value="st1">Staff</option>
+ </select></label>
+ <label>Digit id probe<input id="0123abc-def" type="text" placeholder="digit-leading id"></label>
+ <label>Notes<textarea id="notes" rows="2"></textarea></label>
 </section>
-<div class="q" id="q-mgr">
-<p>Are you a manager team lead?</p>
-<button type="button" aria-pressed="false" data-g="mgr" onclick="grpPick(this,'mgr')">Yes</button>
-<button type="button" aria-pressed="false" data-g="mgr" onclick="grpPick(this,'mgr')">No</button>
-</div>
+ <div class="q" id="q-mgr">
+ <p>Are you a manager team lead?</p>
+ <button type="button" aria-pressed="false" data-g="mgr" onclick="grpPick(this,'mgr')">Yes</button>
+ <button type="button" aria-pressed="false" data-g="mgr" onclick="grpPick(this,'mgr')">No</button>
+ </div>
+ <div class="q" id="q-ver">
+ <p>Which platform version is in production?</p>
+ <label><input type="radio" name="ver" data-reg="ver" id="v1">Stable</label>
+ <label><input type="radio" name="ver" data-reg="ver" id="v2">Current</label>
+ <label><input type="radio" name="ver" data-reg="ver" id="v3">Nightly</label>
+ </div>
 <div class="q" id="q-city">
 <p>In which cities do you plan to live?</p>
 <label><input type="checkbox" name="city" id="c-denver">Denver</label>
@@ -71,11 +78,20 @@ textarea,input,select{padding:6px 8px;border:1px solid #9ca3af;border-radius:6px
 <div style="height:2000px"></div>
 <button id="submitbtn" type="button">Submit Test</button>
 </div>
-<script>
+ <script>
 function grpPick(btn, g){
   document.querySelectorAll('button[data-g="'+g+'"]').forEach(function(b){ b.setAttribute('aria-pressed','false'); });
   btn.setAttribute('aria-pressed','true');
 }
+// Framework state that only registers on a REAL change event (like Ashby's
+// form state: DOM checked !== form state when set programmatically).
+window.__reg = {};
+document.querySelectorAll('input[data-reg]').forEach(function(inp){
+  inp.addEventListener('change', function(){
+    window.__reg[inp.dataset.reg] = inp.checked ? (inp.closest('label').textContent || '').trim() : '';
+  });
+});
+document.getElementById('v2').checked = true; // stale direct DOM set: __reg.ver stays unset
 </script>
 </body></html>`);
 
@@ -140,8 +156,24 @@ try {
   check('neg: fx_answer unknown question', await call('fx_answer', { question: 'zzz-not-there', choice: 'Yes' }), (t, e) => e && t.includes('no-question'));
   check('neg: fx_field bogus index', await call('fx_field', { index: 999 }), (t, e) => e && t.includes('field index not found'));
   check('neg: fx_field file input -> fx_upload hint', await call('fx_field', { id: 'cv', value: 'x' }), (t, e) => e && t.includes('fx_upload'));
-  const rb = await call('fx_eval', { js: `return ['name='+document.getElementById('name').value,'email='+document.getElementById('email').value,'role='+document.getElementById('role').value,'nyc='+document.getElementById('c-nyc').checked,'phone='+document.getElementById('r-phone').checked,'mgrYes='+(document.querySelector('button[data-g="mgr"][aria-pressed="true"]')||{}).textContent].join('|');` });
-  check('readback: final state on page', rb, (t) => t.includes('name=Test User') && t.includes('email=test@example.com') && t.includes('role=s1') && t.includes('nyc=true') && t.includes('phone=true') && t.includes('mgrYes=Yes'));
+  check('fx_eval: awaits a Promise-returning body', await call('fx_eval', { js: 'return new Promise(function (r) { setTimeout(function () { r("settled-e2e"); }, 250); });' }), (t, e) => !e && t.includes('"awaited": true') && t.includes('settled-e2e'));
+  check('fx_eval: errors when the Promise never settles', await call('fx_eval', { js: 'return new Promise(function () {});', wait_ms: 400 }), (t, e) => e && t.includes('did not settle within 400 ms'));
+  check('fx_type: digit-leading #id auto-rewritten to [id="…"]', await call('fx_type', { selector: '#0123abc-def', text: 'digit-ok' }), (t, e) => !e && /"used": "\[id=\\"0123abc-def\\"\]/.test(t));
+  check('fx_form: aggregated choice groups (context per group)', await call('fx_form', {}), (t, e) => {
+    if (e) return false;
+    const o = JSON.parse(t);
+    const g = (o.groups || []).map((x) => x.ctx).join('|');
+    return o.groups && o.groups.length >= 3 && g.includes('platform version') && g.includes('plan to live') && g.includes('contact method');
+  });
+  check('fx_answer: exclusive group, stale pre-selected radio -> toggle cycle ok', await call('fx_answer', { question: 'platform version', choice: 'Current' }), (t, e) => !e && t.includes('"ok": true') && t.includes('toggle'));
+  check('fx_answer: toggle cycle registered the framework state (__reg)', await call('fx_eval', { js: 'return window.__reg && window.__reg.ver;' }), (t) => t.includes('Current'));
+  check('fx_snapshot: label captured as lbl=', await call('fx_snapshot', {}), (t) => t.includes('lbl="Full Name"'));
+  const shot = '/tmp/marionette-mcp/e2e_full.png';
+  check('fx_screenshot: full-page PNG (IHDR height beyond viewport)', await call('fx_screenshot', { path: shot }), (t) => {
+    try { const b = fs.readFileSync(shot); return b.length > 100 && b.readUInt32BE(16) > 0 && b.readUInt32BE(20) > 1500; } catch { return false; }
+  });
+  const rb = await call('fx_eval', { js: `return ['name='+document.getElementById('name').value,'email='+document.getElementById('email').value,'role='+document.getElementById('role').value,'nyc='+document.getElementById('c-nyc').checked,'phone='+document.getElementById('r-phone').checked,'mgrYes='+(document.querySelector('button[data-g="mgr"][aria-pressed="true"]')||{}).textContent,'digit='+document.getElementById('0123abc-def').value].join('|');` });
+  check('readback: final state on page', rb, (t) => t.includes('name=Test User') && t.includes('email=test@example.com') && t.includes('role=s1') && t.includes('nyc=true') && t.includes('phone=true') && t.includes('mgrYes=Yes') && t.includes('digit=digit-ok'));
 } catch (e) {
   fails++;
   console.log('FAIL  harness exception:', e.message, '\n      server stderr tail:', childErr.split('\n').slice(-5).join(' | '));

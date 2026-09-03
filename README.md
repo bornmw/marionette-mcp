@@ -34,6 +34,9 @@ Playwright's browser-automation channels (CDP, extension mode) target Chromium, 
 * **Element refs are unwrapped.** `FindElement` replies wrap the uuid (`{ "element-…": "uuid" }`); subsequent commands (`ElementClick`, `ElementSendKeys`, …) take the *bare* uuid.
 * **File uploads use the raw absolute path** in `ElementSendKeys` — this protocol generation has no W3C base64 file encoding (those codepoints are the legacy Selenium `NULL`/`CANCEL` keys there).
 * **Script bodies must `return`.** W3C `ExecuteScript` bodies are function *bodies*: a bare expression statement evaluates and is discarded.
+* **Marionette never awaits returned Promises.** A `return (async () => { … })()` body would serialize to `null` immediately, so `fx_eval` runs the body through a synchronous wrapper and polls `window` until the Promise settles (two-phase protocol; `wait_ms` bounds it, default 30 s).
+* **`#id` CSS selectors with digit-leading ids are invalid** (e.g. Ashby's UUID ids `#56d78818-…`). `fx_click`/`fx_type` auto-rewrite them to `[id="…"]` and report the rewrite (`used`); unsupported CSS (e.g. `:has()`) is caught in-page before the driver call with an actionable error.
+* **DOM `checked` ≠ framework form state.** Frameworks (notably Ashby) register a choice only on a real *change*. `fx_answer` therefore detects a stale pre-selected option (or an ineffective click) and runs a toggle cycle — click another option, then the target — on exclusive (radio/button) groups, re-verifying afterwards; `fx_form` aggregates radio/checkbox inputs into choice groups (question context + per-option state) so required groups can be audited in one call.
 * Marionette keeps a **persistent session across reconnects**; a crashed automation client can leave stale session state — relaunch the browser if commands queue forever.
 
 ## Quick start
@@ -72,7 +75,7 @@ Then the `fx_*` tools are available in-session. Typical flow:
 4. Forms: `fx_form` → field map (index/label/context/value), then `fx_field` (set by index/id/label) and `fx_answer` (Yes/No or radio/checkbox questions by question text + option label); `fx_scroll` before clicking elements obscured by fixed headers
 5. `fx_wait` for the next state; `fx_screenshot` + your own vision pass to verify what the DOM can't
 
-Form-tool gotchas (from live ATS/portal forms): re-renders can silently drop checked boxes — re-verify all fields after any state change; a free-text location field is often separate from a city checkbox group; DOM `checked` ≠ the framework's form state — trust the tools' `confirmed`/`verified` output.
+Form-tool gotchas (from live ATS/portal forms): re-renders can silently drop checked boxes — re-verify all fields after any state change; a free-text location field is often separate from a city checkbox group; required radio groups are sometimes not wrapped in labeled field containers — audit `fx_form.groups` (and a final screenshot) instead of assuming the labeled fields are the whole form; DOM `checked` ≠ the framework's form state — trust the tools' `confirmed`/`verified` output (a stale pre-selected option is the classic failure: `fx_answer` handles it via the toggle cycle).
 
 ## Tools
 
@@ -81,19 +84,19 @@ Form-tool gotchas (from live ATS/portal forms): re-renders can silently drop che
 | `fx_status` | Connection, session, current page, `navigator.webdriver` |
 | `fx_navigate` | Go to a URL |
 | `fx_page` | Current URL + title |
-| `fx_snapshot` | Interactive-element map with refs |
-| `fx_click` | Click (ref or selector) |
-| `fx_type` | Type text (clears first unless `keep: true`) |
+| `fx_snapshot` | Interactive-element map with refs (incl. visible `label` text when present) |
+| `fx_click` | Click (ref or selector; digit-leading `#id` auto-rewritten to `[id="…"]`, unsupported CSS caught in-page) |
+| `fx_type` | Type text (clears first unless `keep: true`; same selector hardening) |
 | `fx_select` | Set `<select>` by option value or label |
 | `fx_toggle` | Set checkbox/radio state |
 | `fx_upload` | Set file input (raw path, must be under `FX_MCP_FILE_ROOTS`) |
-| `fx_form` | Dump visible form fields: index, type, label, context, value, options, files (scopes to a CSS `root`) |
+| `fx_form` | Dump visible form fields: index, type, label, name, context, value, options, files + aggregated choice groups (question context, per-option state); scopes to a CSS `root` |
 | `fx_field` | Set a field by index (from `fx_form`), id, or label substring: real keystrokes for text, verified real click (with fallbacks) for checkbox/radio, option match for select |
-| `fx_answer` | Answer a grouped choice question (Yes/No buttons, radio/checkbox options) by question text + option label; re-reads and reports the selection state |
+| `fx_answer` | Answer a grouped choice question (Yes/No buttons, radio/checkbox options) by question text + option label; re-reads and reports the selection state; runs a toggle cycle on exclusive groups when a stale pre-selection (or ineffective click) is detected |
 | `fx_scroll` | Scroll an element into view (e.g. under a fixed header), wait, return its top coordinate |
-| `fx_eval` | Run JS in the page (function body; `return` your value) |
+| `fx_eval` | Run JS in the page (function body; `return` your value — a returned Promise is awaited, default 30 s via `wait_ms`) |
 | `fx_wait` | Wait for visible text or CSS selector (≤ 30 s) |
-| `fx_screenshot` | Save PNG under an allowed root |
+| `fx_screenshot` | Full-page PNG (not just the viewport) to a file under an allowed root |
 | `fx_windows` / `fx_window` | List / switch windows |
 | `fx_alert_state` / `fx_alert_accept` / `fx_alert_dismiss` | Native dialogs |
 | `fx_cookies` | Current-origin cookies (names/domains only) |

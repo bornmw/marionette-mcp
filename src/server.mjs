@@ -60,7 +60,7 @@ function refMarker(a) {
   if (a.selector) {
     if (a.selector.startsWith('xpath:')) return a.selector;
     if (a.selector.startsWith('/')) return 'xpath:' + a.selector;
-    return a.selector;
+    return hardenCss(a.selector);
   }
   throw new Error('need ref (from fx_snapshot) or selector');
 }
@@ -71,6 +71,36 @@ async function execJs(code, args) {
   const r = await M.cmd('WebDriver:ExecuteScript', { script: code, args: args || [] });
   return r.value;
 }
+
+// A CSS `#id` whose id is not a valid bare identifier (starts with a digit, e.g.
+// Ashby's UUID ids) is rejected by querySelector; rewrite to the quoted attr form.
+function hardenCss(sel) {
+  if (typeof sel !== 'string') return sel;
+  const m = sel.match(/^#([^{,\s]+)$/);
+  if (m && /^-?\d/.test(m[1])) return '[id="' + m[1].replace(/"/g, '\\"') + '"]';
+  return sel;
+}
+
+// Cheap in-page validation of a CSS selector before FindElement, so unsupported
+// syntax (e.g. :has(), rejected by Gecko's querySelector) yields an actionable
+// error instead of a raw driver exception.
+async function checkCss(sel) {
+  const r = await execJs(`/*__csscheck__*/
+try { document.querySelector(arguments[0]); return 'ok'; } catch (e) { return 'bad:' + (e && e.message ? String(e.message) : String(e)); }`, [sel]);
+  const s = String(r == null ? 'ok' : r);
+  if (s.slice(0, 4) === 'bad:') {
+    throw new Error('CSS selector rejected by the page: ' + s.slice(4).slice(0, 100) +
+      ' — the browser does not support all CSS (e.g. :has() is not supported); use [attr="…"]/.class/xpath forms, or fx_form/fx_field/fx_answer by label');
+  }
+}
+
+// Two-phase fx_eval: the wrapper runs the user body synchronously in-page and
+// reports {ok|err|pend}; a pending Promise settles into window.__fxr and is
+// polled, so `return (async () => { … })()` bodies can be awaited.
+const EVAL_WRAP = (body) =>
+  'var __r; try { __r = (function(){ ' + body + ' })(); } catch (e) { return { __fx: "err", m: String((e && e.message) || e) }; } if (__r && typeof __r.then === "function") { __r.then(function (v) { window.__fxr = { __fx: "ok", v: v }; }, function (e) { window.__fxr = { __fx: "err", m: String((e && e.message) || e) }; }); return { __fx: "pend" }; } return { __fx: "ok", v: __r }; /*__fxeval__*/';
+const EVAL_POLL = `/*__fxpoll__*/
+var __w = window.__fxr; if (__w) { delete window.__fxr; return __w; } return null;`;
 
 function allowedPath(abs) {
   return FILE_ROOTS.some((r0) => abs === r0 || abs.startsWith(r0 + path.sep));
@@ -111,9 +141,14 @@ return (function () {
     let txt = el.innerText || el.getAttribute('aria-label') || el.placeholder || '';
     txt = (txt || '').trim().replace(/\\s+/g, ' ').slice(0, 70);
     const css = el.id && document.querySelector('#' + CSS.escape(el.id)) === el ? '#' + CSS.escape(el.id) : '';
+    let lbl = '';
+    var lEl = el.id ? document.querySelector('label[for="' + CSS.escape(el.id) + '"]') : null;
+    if (lEl && (lEl.textContent || '').trim()) lbl = (lEl.textContent || '').trim().replace(/\\s+/g, ' ').slice(0, 90);
+    if (!lbl && el.closest) { var wL = el.closest('label'); if (wL) { var wt = (wL.textContent || '').trim(); if (wt) lbl = wt.replace(/\\s+/g, ' ').slice(0, 90); } }
     out.push({
       i: i++, k: kind, x, t: txt, css,
       id: el.id || '',
+      l: lbl,
       ph: el.placeholder || '',
       al: el.getAttribute('aria-label') || '',
       val: el.type === 'password' ? '-pw-' : String(el.value ?? '').slice(0, 30),
@@ -136,6 +171,7 @@ function fmtSnapshot(rows) {
     n++;
     const bits = [r.k];
     if (r.id) bits.push('#' + r.id);
+    if (r.l) bits.push('lbl=' + JSON.stringify(r.l));
     if (r.al) bits.push('aria=' + JSON.stringify(r.al));
     if (r.ph) bits.push('ph=' + JSON.stringify(r.ph));
     if (r.val) bits.push('val=' + JSON.stringify(r.val));
@@ -170,7 +206,7 @@ return (function(){
   function labelOf(el){ if(el.id){ var l=document.querySelector('label[for="'+CSS.escape(el.id)+'"]'); if(l && norm(l.textContent)) return norm(l.textContent).slice(0,120); } var wl=el.closest?el.closest('label'):null; if(wl){ var wt=norm(wl.textContent); if(wt) return wt.slice(0,120); } var al=el.getAttribute('aria-label'); if(al && norm(al)) return norm(al).slice(0,120); return ''; }
   function ctxOf(el){ var t=el.parentElement, g=0; while(t && g<7){ var c=norm(t.textContent); if(c.length>=15 && c.length<=600) return c.slice(0,160); t=t.parentElement; g++; } return ''; }
   function markerOf(el){ if(el.id){ var m='#'+CSS.escape(el.id); try{ if(document.querySelector(m)===el) return m; }catch(e){} } return 'xpath:'+__xp(el); }
-  var scope = rc ? (document.querySelector(rc) || document) : document;
+    var scope = rc ? (document.querySelector(rc) || document) : document;
   var fields=[];
   scope.querySelectorAll('input,textarea,select').forEach(function(el){
     if(!vis(el)) return;
@@ -181,10 +217,20 @@ return (function(){
     if(el.type==='checkbox' || el.type==='radio'){ f.on = el.checked?1:0; }
     fields.push(f);
   });
+  var cap = fields.slice(0,max);
+  var groups=[]; var gmap={};
+  cap.forEach(function(f){
+    if(f.type!=='radio' && f.type!=='checkbox') return;
+    var key = f.name ? ('n:' + f.name) : ('c:' + norm(f.ctx).slice(0,40));
+    if(!gmap[key]){ gmap[key]={ key: key, type: f.type, name: f.name||'', ctx: f.ctx||'', req: f.req?1:0, single: true, options: [] }; groups.push(gmap[key]); }
+    var g = gmap[key];
+    g.options.push({ i: f.i, label: (f.label||f.ph||('field-'+f.i)).slice(0,60), on: f.on?1:0 });
+    if(f.type==='checkbox') g.single=false;
+  });
   if(id){ for(var i=0;i<fields.length;i++){ if(fields[i].id===id) return [fields[i]]; } return null; }
   if(lq){ var m2=[]; for(var j=0;j<fields.length;j++){ if(norm(fields[j].label).toLowerCase().indexOf(lq)>=0) m2.push(fields[j]); } return m2.slice(0,10); }
   if(only){ var m3=[]; for(var k=0;k<fields.length;k++){ if(fields[k].i===only) m3.push(fields[k]); } return m3; }
-  return fields.slice(0,max);
+  return { f: cap, g: groups };
 })(arguments[0], arguments[1], arguments[2], arguments[3], arguments[4]);
 `;
 
@@ -217,7 +263,9 @@ return (function(){
   var p=picks[0];
   var labelMarker=null;
   if(p.kind==='input'){ var l2=p.el.id?document.querySelector('label[for="'+CSS.escape(p.el.id)+'"]'):null; if(l2 && vis(l2)) labelMarker=markerOf(l2); }
-  return { ctx: matched[0][0].slice(0,240), option: p.label, kind: p.kind, marker: markerOf(p.el), labelMarker: labelMarker || null, state: selState(p.el), options: arr.map(function(c){ return c.label; }).slice(0,12) };
+  var single = arr.every(function(c){ return (c.kind==='button'||c.kind==='role') || (c.el && c.el.type==='radio'); });
+  var alts = arr.filter(function(c){ return c.label!==p.label; }).slice(0,2).map(function(c){ return { label: c.label, kind: c.kind, marker: markerOf(c.el), state: selState(c.el) }; });
+  return { ctx: matched[0][0].slice(0,240), option: p.label, kind: p.kind, marker: markerOf(p.el), labelMarker: labelMarker || null, state: selState(p.el), single: single, alts: alts, options: arr.map(function(c){ return c.label; }).slice(0,12) };
 })(arguments[0], arguments[1], arguments[2]);
 `;
 
@@ -248,18 +296,20 @@ const TOOLS = [
   T('fx_snapshot', 'Interactive-element map with refs (use refs in fx_click/fx_type/...)', {}, async () => {
     return fmtSnapshot(await execJs(SNAPSHOT_JS));
   }),
-  T('fx_click', 'Click element by ref (from fx_snapshot) or CSS selector', { ref: { type: 'number' }, selector: { type: 'string' } }, async (a) => {
+  T('fx_click', 'Click element by ref (from fx_snapshot) or CSS selector. Digit-leading ids: use [id="…"] form (a bare #1abc is not valid CSS) — or pass it as-is and the tool will rewrite it for you. Unsupported CSS (e.g. :has()) is caught in-page with an actionable error before the driver call.', { ref: { type: 'number' }, selector: { type: 'string' } }, async (a) => {
     const p = resolveElRef(a);
+    if (p.using === 'css selector') { p.value = hardenCss(p.value); await checkCss(p.value); }
     const el = await findEl(p.using, p.value);
     await M.cmd('WebDriver:ElementClick', { id: el });
-    return { ok: true, el };
+    return { ok: true, el, used: a.selector && p.value !== a.selector ? p.value : undefined };
   }),
-  T('fx_type', 'Type text into element (clears first unless keep=true)', { ref: { type: 'number' }, selector: { type: 'string' }, text: { type: 'string' }, keep: { type: 'boolean', description: 'true = append instead of clearing' } }, async (a) => {
+  T('fx_type', 'Type text into element (clears first unless keep=true). Same selector rules as fx_click (digit-leading #ids auto-rewritten to [id="…"]; unsupported CSS caught in-page).', { ref: { type: 'number' }, selector: { type: 'string' }, text: { type: 'string' }, keep: { type: 'boolean', description: 'true = append instead of clearing' } }, async (a) => {
     const p = resolveElRef(a);
+    if (p.using === 'css selector') { p.value = hardenCss(p.value); await checkCss(p.value); }
     const el = await findEl(p.using, p.value);
     if (!a.keep) await M.cmd('WebDriver:ElementClear', { id: el }).catch(() => {});
     await M.cmd('WebDriver:ElementSendKeys', { id: el, text: a.text });
-    return { ok: true };
+    return { ok: true, used: a.selector && p.value !== a.selector ? p.value : undefined };
   }),
   T('fx_select', 'Set <select> by option value or visible label', { ref: { type: 'number' }, selector: { type: 'string' }, value: { type: 'string' }, label: { type: 'string' } }, async (a) => {
     const mk = refMarker(a);
@@ -286,14 +336,18 @@ const TOOLS = [
     const got = await execJs(EL0 + ` return el&&el.files&&el.files[0] ? el.files[0].name : 'no-file-set';`, [refMarker(a)]);
     return { uploaded: got, path: abs };
   }),
-  T('fx_form', 'Structured dump of all visible form fields on the page: index, type, label, context, value, options, files. Form workflow: run fx_form first to learn the fields, then set values with fx_field (by index/id/label) and answer radio/checkbox/button questions with fx_answer. Prefer these over hand-written fx_eval form scripts. Optional CSS root scopes the dump.', { root: { type: 'string', description: 'CSS selector to scope the dump (default: whole page)' }, max: { type: 'number', description: 'max fields (default 80)' } }, async (a) => {
+  T('fx_form', 'Structured dump of all visible form fields on the page: index, type, label, context, value, options, files, plus aggregated choice groups (radio/checkbox sets with their question context and per-option state) — audit every required group, not just individually labeled fields. Form workflow: run fx_form first to learn the fields/groups, then set values with fx_field (by index/id/label) and answer radio/checkbox/button questions with fx_answer. Prefer these over hand-written fx_eval form scripts. Optional CSS root scopes the dump.', { root: { type: 'string', description: 'CSS selector to scope the dump (default: whole page)' }, max: { type: 'number', description: 'max fields (default 80)' } }, async (a) => {
     const recs = await execJs(FIELD_JS, [Math.min(300, Math.max(1, Number(a.max) || 80)), 0, '', '', a.root || '']);
-    if (!Array.isArray(recs)) throw new Error('form dump returned ' + typeof recs);
+    let arr, groups;
+    if (recs && typeof recs === 'object' && Array.isArray(recs.f)) { arr = recs.f; groups = recs.g || []; }
+    else if (Array.isArray(recs)) { arr = recs; groups = []; }
+    else throw new Error('form dump returned ' + typeof recs);
     return {
-      count: recs.length,
-      fields: recs.map((f) => {
+      count: arr.length,
+      fields: arr.map((f) => {
         const o = { i: f.i, type: f.tag === 'select' ? 'select' : (f.type || f.tag) };
         o.label = (f.label || f.ph || (f.id ? f.id : 'field-' + f.i)).slice(0, 80);
+        if (f.name) o.name = f.name;
         if (f.ctx) o.ctx = f.ctx;
         if (f.val !== undefined) o.value = f.val;
         if (f.on !== undefined) o.on = !!f.on;
@@ -303,6 +357,7 @@ const TOOLS = [
         if (f.req) o.required = true;
         return o;
       }),
+      ...(groups.length ? { groups: groups.map((g) => ({ type: g.type, name: g.name, ctx: (g.ctx || '').slice(0, 140), required: !!g.req, single: !!g.single, options: g.options.map((o) => ({ i: o.i, label: o.label, on: !!o.on })) })) } : {}),
     };
   }),
   T('fx_field', 'Set a form field by index (from fx_form), by id, or by label substring. Text/textarea = real keystrokes (framework-safe); checkbox/radio = real click that reaches the wanted state (pass value "on"/"off", default on) with verify + label-click + event fallbacks; select = option match by value or label. Scrolls the field into view automatically. File inputs: use fx_upload.', { index: { type: 'number', description: 'field index from fx_form' }, id: { type: 'string', description: 'field id attribute' }, label: { type: 'string', description: 'field label (substring match)' }, value: { type: 'string', description: 'text to type / option value / "on"|"off" for checkbox-radio' } }, async (a) => {
@@ -381,32 +436,57 @@ const TOOLS = [
     const conf = await execJs(EL0 + ` return el?String(el.value):'gone';`, [field.m]);
     return { ok: conf !== 'gone' && (a.value == null || conf === String(a.value)), field: fmtField(field), confirmed: conf.slice(0, 120) };
   }),
-  T('fx_answer', 'Answer a grouped choice question (Yes/No button groups, radio or checkbox option groups): locate the group by matching the question text, pick the option by its label, perform a real click, then re-read and report the resulting selection state. Use this instead of clicking raw button refs — option order/refs can shift on re-render, and matching by question text prevents picking the wrong option of a neighbouring question.', { question: { type: 'string', description: 'text that must appear in the question context' }, choice: { type: 'string', description: 'option label to select, e.g. "Yes" or "New York City"' }, exact: { type: 'boolean', description: 'require exact label match (default false: case-insensitive substring allowed)' } }, async (a) => {
+  T('fx_answer', 'Answer a grouped choice question (Yes/No button groups, radio or checkbox option groups): locate the group by matching the question text, pick the option by its label, perform a real click, then re-read and report the resulting selection state. If the target was already selected (or is still not selected) after the click — a no-op click that frameworks often do not register — performs a toggle cycle (click another option, then the target) on exclusive groups and re-verifies. Use this instead of clicking raw button refs — option order/refs can shift on re-render, and matching by question text prevents picking the wrong option of a neighbouring question.', { question: { type: 'string', description: 'text that must appear in the question context' }, choice: { type: 'string', description: 'option label to select, e.g. "Yes" or "New York City"' }, exact: { type: 'boolean', description: 'require exact label match (default false: case-insensitive substring allowed)' } }, async (a) => {
     if (!a.question || !a.choice) throw new Error('need question + choice');
     const found0 = await execJs(ANSWER_FIND_JS, [a.question, a.choice, a.exact !== true]);
     if (!found0 || typeof found0 !== 'object' || !found0.marker) throw new Error('fx_answer: ' + JSON.stringify(found0));
+    const pre = found0.state;
     await execJs(EL0 + ` if(el) el.scrollIntoView({block:'center',behavior:'instant'}); return 'ok';`, [found0.marker]);
     await new Promise((r) => setTimeout(r, 150));
     let via;
     const primary = found0.labelMarker || found0.marker;
-    try {
-      const el = await findEl(markerRef(primary));
-      await M.cmd('WebDriver:ElementClick', { id: el });
-      via = found0.labelMarker ? 'label' : 'element';
-    } catch (e) {
-      if (!found0.labelMarker) throw e;
-      const el = await findEl(markerRef(found0.marker));
-      await M.cmd('WebDriver:ElementClick', { id: el });
-      via = 'element( fallback )';
+    async function clickPrimary(fallbackNote) {
+      try {
+        const el = await findEl(markerRef(primary));
+        await M.cmd('WebDriver:ElementClick', { id: el });
+        via = fallbackNote ? 'element(' + fallbackNote + ')' : (found0.labelMarker ? 'label' : 'element');
+      } catch (e) {
+        if (!found0.labelMarker) throw e;
+        const el = await findEl(markerRef(found0.marker));
+        await M.cmd('WebDriver:ElementClick', { id: el });
+        via = 'element( fallback )';
+      }
     }
+    await clickPrimary();
     await new Promise((r) => setTimeout(r, 300));
-    const after = await execJs(ANSWER_FIND_JS, [a.question, a.choice, true]);
-    const state = after && after.option === found0.option ? after.state : 'unreadable';
+    let after = await execJs(ANSWER_FIND_JS, [a.question, a.choice, true]);
+    let state = after && after.option === found0.option ? after.state : 'unreadable';
+    // A click on an already-selected radio is a no-op in the DOM AND often
+    // unregistered by the framework; a fresh change cycle (other option, then
+    // target) is the only reliable way to (re)set the answer.
+    if (found0.single && (pre === 'on' || state === 'off' || state === 'unreadable')) {
+      let toggled = false;
+      for (const alt of found0.alts || []) {
+        try {
+          const el = await findEl(markerRef(alt.marker));
+          await M.cmd('WebDriver:ElementClick', { id: el });
+          await new Promise((r) => setTimeout(r, 300));
+          const mid = await execJs(ANSWER_FIND_JS, [a.question, a.choice, true]);
+          if (mid && (mid.state !== pre || pre === 'unknown')) { toggled = true; break; }
+        } catch { /* try next alt */ }
+      }
+      if (toggled) {
+        await clickPrimary('toggle-cycle');
+        await new Promise((r) => setTimeout(r, 300));
+        after = await execJs(ANSWER_FIND_JS, [a.question, a.choice, true]);
+        if (after && after.option === found0.option) state = after.state;
+      }
+    }
     let verified;
     if (state === 'on') verified = 'selected';
     else if (state === 'off') verified = 'NOT-SELECTED — click may have toggled it off; verify';
     else verified = 'no selection signal on this control type — verify (e.g. re-run fx_form)';
-    return { ok: state !== 'off', question: found0.ctx, answer: found0.option, via, state: state === 'unreadable' ? 'unknown' : state, verified };
+    return { ok: state !== 'off', question: found0.ctx, answer: found0.option, pre, via, state: state === 'unreadable' ? 'unknown' : state, verified };
   }),
   T('fx_scroll', 'Scroll an element (ref from fx_snapshot, or selector) into view so it is not obscured (e.g. by a fixed header/cookie bar), wait, and return its top coordinate. Use before clicking elements that failed as "not clickable because another element obscures it".', { ref: { type: 'number' }, selector: { type: 'string' }, pos: { type: 'string', description: 'start | center | end (default center)' }, wait_ms: { type: 'number', description: 'wait after scroll (default 400, max 2000)' } }, async (a) => {
     const mk = refMarker(a);
@@ -416,8 +496,24 @@ const TOOLS = [
     await new Promise((r2) => setTimeout(r2, Math.min(2000, Math.max(0, Number(a.wait_ms) || 400))));
     return { r };
   }),
-  T('fx_eval', 'Execute JS in the page (script = function body, may return a value)', { js: { type: 'string' } }, async (a) => {
-    return { r: await execJs(a.js, []) };
+  T('fx_eval', 'Execute JS in the page (script = function body, may return a value). Synchronous bodies behave as before ({r: value}). If the body returns a Promise — e.g. `return (async () => { … })()` after a fetch/timeout — the call awaits it (default max 30s, wait_ms to tune) and returns {r: value, awaited: true}; a rejected or long-unsettled Promise is an error.', { js: { type: 'string' }, wait_ms: { type: 'number', description: 'max wait for a Promise-returning body (default 30000, max 120000)' } }, async (a) => {
+    const w = await execJs(EVAL_WRAP(String(a.js)), []);
+    if (!w || typeof w !== 'object' || typeof w.__fx !== 'string') {
+      throw new Error('fx_eval: body must `return` a value (for async work: `return (async () => { … })()`); bare expression statements are discarded');
+    }
+    if (w.__fx === 'err') throw new Error('fx_eval page error: ' + (w.m || 'unknown'));
+    if (w.__fx === 'ok') return { r: w.v };
+    const ms = Math.min(120000, Math.max(0, Number(a.wait_ms) || 30000));
+    const t0 = Date.now();
+    for (;;) {
+      const p = await execJs(EVAL_POLL, []);
+      if (p && typeof p === 'object' && typeof p.__fx === 'string') {
+        if (p.__fx === 'err') throw new Error('fx_eval: Promise rejected: ' + (p.m || 'unknown'));
+        return { r: p.v, awaited: true };
+      }
+      if (Date.now() - t0 > ms) throw new Error('fx_eval: Promise did not settle within ' + ms + ' ms');
+      await new Promise((r) => setTimeout(r, 150));
+    }
   }),
   T('fx_wait', 'Wait until visible text (or CSS selector exists). Default 10s, max 30s', { text: { type: 'string' }, selector: { type: 'string' }, timeout_ms: { type: 'number' } }, async (a) => {
     const ms = Math.min(30000, a.timeout_ms || 10000);
@@ -434,7 +530,7 @@ const TOOLS = [
       await new Promise((r) => setTimeout(r, 500));
     }
   }),
-  T('fx_screenshot', 'View PNG to a file under an allowed root (or explicit allowed path)', { path: { type: 'string' } }, async (a) => {
+  T('fx_screenshot', 'Full-page PNG (Marionette captures the entire scrollable document, not just the viewport) to a file under an allowed root (or explicit allowed path)', { path: { type: 'string' } }, async (a) => {
     const dest = a.path || '/tmp/marionette-mcp/shot_' + Date.now() + '.png';
     const abs = path.resolve(dest);
     if (!allowedPath(abs)) throw new Error('path outside allowed roots');
