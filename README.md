@@ -18,7 +18,7 @@ Playwright's browser-automation channels (CDP, extension mode) target Chromium, 
  AI agent (e.g. opencode)
         │  stdio · newline-delimited JSON-RPC 2.0
         ▼
- marionette-mcp (src/server.mjs)          ── tools: fx_* (18)
+ marionette-mcp (src/server.mjs)          ── tools: fx_* (22)
         │  loopback TCP · <byteLen>:<json> frames
         ▼
  your Firefox (firefox --marionette)      ── your profile, your cookies
@@ -69,7 +69,10 @@ Then the `fx_*` tools are available in-session. Typical flow:
 1. `fx_navigate` to the page
 2. `fx_snapshot` → numbered map of interactive elements (refs)
 3. `fx_click` / `fx_type` / `fx_select` / `fx_toggle` / `fx_upload` by `ref` (or CSS `selector`)
-4. `fx_wait` for the next state; `fx_screenshot` + your own vision pass to verify what the DOM can't
+4. Forms: `fx_form` → field map (index/label/context/value), then `fx_field` (set by index/id/label) and `fx_answer` (Yes/No or radio/checkbox questions by question text + option label); `fx_scroll` before clicking elements obscured by fixed headers
+5. `fx_wait` for the next state; `fx_screenshot` + your own vision pass to verify what the DOM can't
+
+Form-tool gotchas (from live ATS/portal forms): re-renders can silently drop checked boxes — re-verify all fields after any state change; a free-text location field is often separate from a city checkbox group; DOM `checked` ≠ the framework's form state — trust the tools' `confirmed`/`verified` output.
 
 ## Tools
 
@@ -84,6 +87,10 @@ Then the `fx_*` tools are available in-session. Typical flow:
 | `fx_select` | Set `<select>` by option value or label |
 | `fx_toggle` | Set checkbox/radio state |
 | `fx_upload` | Set file input (raw path, must be under `FX_MCP_FILE_ROOTS`) |
+| `fx_form` | Dump visible form fields: index, type, label, context, value, options, files (scopes to a CSS `root`) |
+| `fx_field` | Set a field by index (from `fx_form`), id, or label substring: real keystrokes for text, verified real click (with fallbacks) for checkbox/radio, option match for select |
+| `fx_answer` | Answer a grouped choice question (Yes/No buttons, radio/checkbox options) by question text + option label; re-reads and reports the selection state |
+| `fx_scroll` | Scroll an element into view (e.g. under a fixed header), wait, return its top coordinate |
 | `fx_eval` | Run JS in the page (function body; `return` your value) |
 | `fx_wait` | Wait for visible text or CSS selector (≤ 30 s) |
 | `fx_screenshot` | Save PNG under an allowed root |
@@ -117,7 +124,10 @@ npm test            # or: node --test test/
 * `test/marionette.test.mjs` — the real client against an in-process fake Marionette server that verifies every frame's byte integrity (non-ASCII payloads included).
 * `test/server.test.mjs` — spawns the real MCP server and drives it end-to-end (JSON-RPC plumbing, all tool paths, framing-safety under Unicode input, stdin-EOF shutdown).
 
-`npm run e2e:live` additionally exercises a real `firefox --marionette` you start yourself.
+Live-browser tests (start your own `firefox --marionette` first; note Marionette serves one active client at a time — no other marionette-mcp client may be attached):
+
+* `npm run e2e:live` — connection, navigation, screenshot through the real wire protocol.
+* `npm run e2e:forms` — the form primitives against a self-generated test page (labels, option/state round-trips, click fallbacks, negative cases).
 
 CI: `.github/workflows/ci.yml` — syntax check + full test suite across Node 20/22/24.
 
