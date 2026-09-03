@@ -44,6 +44,8 @@ function resolveElRef(args) {
 }
 
 async function findEl(using, value) {
+  // accepts (using, value) or a single {using, value} ref object
+  if (using && typeof using === 'object' && using.using) { value = using.value; using = using.using; }
   const r = await M.cmd('WebDriver:FindElement', { using, value });
   return unwrapElementRef(r.value);
 }
@@ -153,6 +155,80 @@ async function pageInfo() {
   return JSON.parse(r.value);
 }
 
+// ---------------- generic form primitives ----------------
+// Page scripts are plain (non-ES-module) scripts run via WebDriver:ExecuteScript.
+// They must return a JSON-serializable value and receive parameters via arguments[].
+const XP_JS = `function __xp(el){ if(!el||el.nodeType!==1) return ''; const p=[]; let n=el; while(n&&n.nodeType===1){ const t=n.tagName.toLowerCase(); const s=n.parentElement?Array.prototype.filter.call(n.parentElement.children,c=>c.tagName===n.tagName):[n]; p.unshift(t+'['+(s.indexOf(n)+1)+']'); n=n.parentElement;} return '/'+p.join('/'); }`;
+
+// Enumerate visible form fields. args: [max, onlyIndex, id, labelQuery(lowercase), rootSelector]
+// Returns: array of {i,tag,type,id,name,label,ph,ctx,dis,req,val?,on?,files?,options?,m(marker)}
+const FIELD_JS = XP_JS + `
+return (function(){
+  var max=Number(arguments[0])||80, only=Number(arguments[1])||0, id=arguments[2]||'', lq=(arguments[3]||'').toLowerCase(), rc=arguments[4]||'';
+  function norm(s){ return (s==null?'':String(s)).trim().replace(/\\s+/g,' '); }
+  function vis(el){ var r=el.getBoundingClientRect(); return r.width>0 && r.height>0 && el.type!=='hidden' && (el.offsetParent!==null || el.getClientRects().length>0); }
+  function labelOf(el){ if(el.id){ var l=document.querySelector('label[for="'+CSS.escape(el.id)+'"]'); if(l && norm(l.textContent)) return norm(l.textContent).slice(0,120); } var wl=el.closest?el.closest('label'):null; if(wl){ var wt=norm(wl.textContent); if(wt) return wt.slice(0,120); } var al=el.getAttribute('aria-label'); if(al && norm(al)) return norm(al).slice(0,120); return ''; }
+  function ctxOf(el){ var t=el.parentElement, g=0; while(t && g<7){ var c=norm(t.textContent); if(c.length>=15 && c.length<=600) return c.slice(0,160); t=t.parentElement; g++; } return ''; }
+  function markerOf(el){ if(el.id){ var m='#'+CSS.escape(el.id); try{ if(document.querySelector(m)===el) return m; }catch(e){} } return 'xpath:'+__xp(el); }
+  var scope = rc ? (document.querySelector(rc) || document) : document;
+  var fields=[];
+  scope.querySelectorAll('input,textarea,select').forEach(function(el){
+    if(!vis(el)) return;
+    var f={ i: fields.length+1, tag: el.tagName.toLowerCase(), type: el.type||'', id: el.id||'', name: el.name||'', label: labelOf(el), ph: el.placeholder||'', ctx: ctxOf(el), dis: el.disabled?1:0, req: el.required?1:0, m: markerOf(el) };
+    if(el.type==='file'){ f.files = Array.prototype.slice.call(el.files||[]).map(function(x){ return x.name; }); }
+    else if(el.tagName==='SELECT'){ f.val = String(el.value); f.options = Array.prototype.slice.call(el.options).slice(0,20).map(function(o){ return { v: o.value, t: norm(o.textContent).slice(0,60), s: o.selected?1:0 }; }); }
+    else { f.val = el.type==='password' ? '-pw-' : String(el.value==null?'':el.value).slice(0,120); }
+    if(el.type==='checkbox' || el.type==='radio'){ f.on = el.checked?1:0; }
+    fields.push(f);
+  });
+  if(id){ for(var i=0;i<fields.length;i++){ if(fields[i].id===id) return [fields[i]]; } return null; }
+  if(lq){ var m2=[]; for(var j=0;j<fields.length;j++){ if(norm(fields[j].label).toLowerCase().indexOf(lq)>=0) m2.push(fields[j]); } return m2.slice(0,10); }
+  if(only){ var m3=[]; for(var k=0;k<fields.length;k++){ if(fields[k].i===only) m3.push(fields[k]); } return m3; }
+  return fields.slice(0,max);
+})(arguments[0], arguments[1], arguments[2], arguments[3], arguments[4]);
+`;
+
+// Locate one choice group by question text and pick an option. args: [question, choice, exact]
+// Returns: {ctx, option, kind, marker, labelMarker, state, options[]} or {error, ...}
+const ANSWER_FIND_JS = XP_JS + `
+return (function(){
+  var Q=(arguments[0]||'').toLowerCase(), C=arguments[1]||'', exact=!!arguments[2];
+  function norm(s){ return (s==null?'':String(s)).trim().replace(/\\s+/g,' '); }
+  function vis(el){ var r=el.getBoundingClientRect(); return r.width>0 && r.height>0 && el.offsetParent!==null; }
+  function ctxOf(el){ var t=el.parentElement, g=0; while(t && g<8){ var c=norm(t.textContent); if(c.length>=15 && c.length<=800) return c.slice(0,240); t=t.parentElement; g++; } return ''; }
+  function labelOf(el){ if(el.id){ var l=document.querySelector('label[for="'+CSS.escape(el.id)+'"]'); if(l && norm(l.textContent)) return norm(l.textContent); } var wl = el.closest ? el.closest('label') : null; if(wl){ var wt = norm(wl.textContent); if(wt) return wt; } var al=el.getAttribute('aria-label'); if(al) return norm(al); if(el.tagName==='BUTTON') return norm(el.textContent); return ''; }
+  function markerOf(el){ if(el.id){ var m='#'+CSS.escape(el.id); try{ if(document.querySelector(m)===el) return m; }catch(e){} } return 'xpath:'+__xp(el); }
+  function selState(el){ if(el.type==='checkbox'||el.type==='radio') return el.checked?'on':'off'; var ap=el.getAttribute('aria-pressed'); if(ap!=null) return ap==='true'?'on':'off'; return 'unknown'; }
+  var cands=[];
+  document.querySelectorAll('input[type=radio],input[type=checkbox]').forEach(function(el){ if(!vis(el)) return; cands.push({ el: el, kind: 'input', label: labelOf(el), ctx: ctxOf(el) }); });
+  document.querySelectorAll('button,[role=radio],[role=switch]').forEach(function(el){ var t=norm(el.textContent); if(!t||t.length>14) return; if(!vis(el)) return; cands.push({ el: el, kind: el.tagName==='BUTTON'?'button':'role', label: t, ctx: ctxOf(el) }); });
+  if(!cands.length) return { error: 'no-choice-controls' };
+  var groups = new Map();
+  cands.forEach(function(c){ var key = c.ctx || '__noctx__'; if(!groups.has(key)) groups.set(key, []); groups.get(key).push(c); });
+  var matched=[];
+  groups.forEach(function(arr, ctx){ if(ctx.toLowerCase().indexOf(Q)>=0) matched.push([ctx, arr]); });
+  if(!matched.length) return { error: 'no-question', hint: 'question text not found near any choice group' };
+  if(matched.length>1) return { error: 'ambiguous-question', groups: matched.map(function(p){ return p[0].slice(0,120); }) };
+  var arr=matched[0][1]; var cl=C.toLowerCase();
+  var picks=arr.filter(function(c){ return norm(c.label).toLowerCase()===cl; });
+  if(!picks.length && !exact) picks=arr.filter(function(c){ return norm(c.label).toLowerCase().indexOf(cl)>=0; });
+  if(!picks.length) return { error: 'no-option', options: arr.map(function(c){ return c.label; }).slice(0,12), ctx: matched[0][0].slice(0,200) };
+  if(picks.length>1) return { error: 'ambiguous-option', options: picks.map(function(c){ return c.label; }), ctx: matched[0][0].slice(0,200) };
+  var p=picks[0];
+  var labelMarker=null;
+  if(p.kind==='input'){ var l2=p.el.id?document.querySelector('label[for="'+CSS.escape(p.el.id)+'"]'):null; if(l2 && vis(l2)) labelMarker=markerOf(l2); }
+  return { ctx: matched[0][0].slice(0,240), option: p.label, kind: p.kind, marker: markerOf(p.el), labelMarker: labelMarker || null, state: selState(p.el), options: arr.map(function(c){ return c.label; }).slice(0,12) };
+})(arguments[0], arguments[1], arguments[2]);
+`;
+
+function markerRef(marker) {
+  if (marker.startsWith('xpath:')) return { using: 'xpath', value: marker.slice(6) };
+  return { using: 'css selector', value: marker };
+}
+function fmtField(f) {
+  return { i: f.i, type: f.tag === 'select' ? 'select' : (f.type || f.tag), label: (f.label || f.ph || f.id || 'field-' + f.i).slice(0, 80) };
+}
+
 // ---------------- MCP tools ----------------
 const T = (name, desc, schema, fn) => ({ name, description: desc, inputSchema: { type: 'object', properties: schema, additionalProperties: false }, fn });
 
@@ -209,6 +285,136 @@ const TOOLS = [
     await new Promise((r) => setTimeout(r, 700));
     const got = await execJs(EL0 + ` return el&&el.files&&el.files[0] ? el.files[0].name : 'no-file-set';`, [refMarker(a)]);
     return { uploaded: got, path: abs };
+  }),
+  T('fx_form', 'Structured dump of all visible form fields on the page: index, type, label, context, value, options, files. Form workflow: run fx_form first to learn the fields, then set values with fx_field (by index/id/label) and answer radio/checkbox/button questions with fx_answer. Prefer these over hand-written fx_eval form scripts. Optional CSS root scopes the dump.', { root: { type: 'string', description: 'CSS selector to scope the dump (default: whole page)' }, max: { type: 'number', description: 'max fields (default 80)' } }, async (a) => {
+    const recs = await execJs(FIELD_JS, [Math.min(300, Math.max(1, Number(a.max) || 80)), 0, '', '', a.root || '']);
+    if (!Array.isArray(recs)) throw new Error('form dump returned ' + typeof recs);
+    return {
+      count: recs.length,
+      fields: recs.map((f) => {
+        const o = { i: f.i, type: f.tag === 'select' ? 'select' : (f.type || f.tag) };
+        o.label = (f.label || f.ph || (f.id ? f.id : 'field-' + f.i)).slice(0, 80);
+        if (f.ctx) o.ctx = f.ctx;
+        if (f.val !== undefined) o.value = f.val;
+        if (f.on !== undefined) o.on = !!f.on;
+        if (f.files) o.files = f.files.slice(0, 10);
+        if (f.options) o.options = f.options;
+        if (f.dis) o.disabled = true;
+        if (f.req) o.required = true;
+        return o;
+      }),
+    };
+  }),
+  T('fx_field', 'Set a form field by index (from fx_form), by id, or by label substring. Text/textarea = real keystrokes (framework-safe); checkbox/radio = real click that reaches the wanted state (pass value "on"/"off", default on) with verify + label-click + event fallbacks; select = option match by value or label. Scrolls the field into view automatically. File inputs: use fx_upload.', { index: { type: 'number', description: 'field index from fx_form' }, id: { type: 'string', description: 'field id attribute' }, label: { type: 'string', description: 'field label (substring match)' }, value: { type: 'string', description: 'text to type / option value / "on"|"off" for checkbox-radio' } }, async (a) => {
+    if (a.index == null && !a.id && !a.label) throw new Error('need index (from fx_form), id, or label');
+    const recs = await execJs(FIELD_JS, [80, Number(a.index) || 0, a.id || '', (a.label || '').trim().toLowerCase(), '']);
+    let field;
+    if (a.index != null || a.id) {
+      if (!Array.isArray(recs) || !recs.length) throw new Error(a.index != null ? 'field index not found (page changed?) — run fx_form again' : 'field id not found: ' + a.id);
+      field = recs[0];
+    } else {
+      if (!Array.isArray(recs) || !recs.length) throw new Error('no visible field with label containing "' + a.label + '"');
+      if (recs.length > 1) throw new Error('ambiguous label "' + a.label + '" -> ' + recs.slice(0, 5).map((f) => f.label + ' (index ' + f.i + ')').join(' | '));
+      field = recs[0];
+    }
+    if (!field || !field.m) throw new Error('field not resolved');
+    await execJs(EL0 + ` if(el) el.scrollIntoView({block:'center',behavior:'instant'}); return 'ok';`, [field.m]);
+    await new Promise((r) => setTimeout(r, 150));
+    const ref = markerRef(field.m);
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+    if (field.type === 'file') throw new Error('file input — use fx_upload with a path under the allowed roots');
+    if (field.tag === 'select') {
+      if (a.value == null) throw new Error('select field: pass value (option value or visible label)');
+      const X = String(a.value);
+      const r = await execJs(EL0 + ` if(!el) return 'el-gone'; const opts=Array.prototype.slice.call(el.options); const X=String(arguments[1]); let m=opts.find(o=>o.value===X); if(!m) m=opts.find(o=>o.textContent.trim()===X); if(!m){ const c=opts.filter(o=>o.textContent.trim().toLowerCase().indexOf(X.toLowerCase())>=0); if(c.length===1) m=c[0]; } if(!m) return 'no-option:'+X.slice(0,40); el.selectedIndex=m.index; el.dispatchEvent(new Event('change',{bubbles:true})); el.dispatchEvent(new Event('input',{bubbles:true})); return 'ok:'+String(m.value);`, [field.m, X]);
+      if (r === 'el-gone') throw new Error('field vanished before select');
+      if (String(r).slice(0, 3) !== 'ok:') throw new Error('select: ' + r);
+      await sleep(150);
+      const conf = await execJs(EL0 + ` return el?String(el.value):null;`, [field.m]);
+      return { ok: true, field: fmtField(field), wanted: X, confirmed: conf };
+    }
+    if (field.type === 'checkbox' || field.type === 'radio') {
+      let want = true;
+      if (a.value != null) {
+        if (typeof a.value === 'boolean') want = a.value;
+        else {
+          const s = String(a.value).trim().toLowerCase();
+          if (/^(off|false|no|0)$/.test(s)) want = false;
+          else if (!/^(on|true|yes|1)$/.test(s)) throw new Error('checkbox/radio: value must be on or off (got "' + a.value + '")');
+        }
+      }
+      const cur = await execJs(EL0 + ` return el?String(el.checked===true):'gone';`, [field.m]);
+      if (cur === 'gone') throw new Error('field vanished before state read');
+      if ((cur === 'true') === want) return { ok: true, unchanged: true, field: fmtField(field), state: want ? 'on' : 'off' };
+      let via = 'none';
+      try {
+        const el = await findEl(ref);
+        await M.cmd('WebDriver:ElementClick', { id: el });
+        via = 'element';
+      } catch {
+        const lm = await execJs(EL0 + ` if(!el||!el.id) return null; const l=document.querySelector('label[for="'+CSS.escape(el.id)+'"]'); if(!l) return null; if(l.id){ try{ const m='#'+CSS.escape(l.id); if(document.querySelector(m)===l) return m; }catch(e){} } return 'xpath:'+__xp(l);`, [field.m]);
+        if (lm && lm !== 'null') {
+          try { const lel = await findEl(markerRef(lm)); await M.cmd('WebDriver:ElementClick', { id: lel }); via = 'label'; } catch { /* event fallback below */ }
+        }
+      }
+      await sleep(250);
+      let now = await execJs(EL0 + ` return el?String(el.checked===true):'gone';`, [field.m]);
+      const goodNow = (want ? now === 'true' : now === 'false');
+      if (!goodNow) {
+        await execJs(EL0 + ` if(el){ el.checked=arguments[1]; el.dispatchEvent(new Event('change',{bubbles:true})); el.dispatchEvent(new Event('click',{bubbles:true})); } return 'done';`, [field.m, want]);
+        await sleep(200);
+        now = await execJs(EL0 + ` return el?String(el.checked===true):'gone';`, [field.m]);
+        via += ' +events-fallback';
+      }
+      const okNow = want ? now === 'true' : now === 'false';
+      return { ok: okNow, field: fmtField(field), wanted: want ? 'on' : 'off', state: now, via };
+    }
+    const el = await findEl(ref).catch(() => null);
+    if (!el) throw new Error('field vanished before type');
+    if (a.value != null) {
+      await M.cmd('WebDriver:ElementClear', { id: el }).catch(() => {});
+      if (String(a.value) !== '') await M.cmd('WebDriver:ElementSendKeys', { id: el, text: String(a.value) });
+    } else {
+      await M.cmd('WebDriver:ElementClear', { id: el }).catch(() => {});
+    }
+    await sleep(150);
+    const conf = await execJs(EL0 + ` return el?String(el.value):'gone';`, [field.m]);
+    return { ok: conf !== 'gone' && (a.value == null || conf === String(a.value)), field: fmtField(field), confirmed: conf.slice(0, 120) };
+  }),
+  T('fx_answer', 'Answer a grouped choice question (Yes/No button groups, radio or checkbox option groups): locate the group by matching the question text, pick the option by its label, perform a real click, then re-read and report the resulting selection state. Use this instead of clicking raw button refs — option order/refs can shift on re-render, and matching by question text prevents picking the wrong option of a neighbouring question.', { question: { type: 'string', description: 'text that must appear in the question context' }, choice: { type: 'string', description: 'option label to select, e.g. "Yes" or "New York City"' }, exact: { type: 'boolean', description: 'require exact label match (default false: case-insensitive substring allowed)' } }, async (a) => {
+    if (!a.question || !a.choice) throw new Error('need question + choice');
+    const found0 = await execJs(ANSWER_FIND_JS, [a.question, a.choice, a.exact !== true]);
+    if (!found0 || typeof found0 !== 'object' || !found0.marker) throw new Error('fx_answer: ' + JSON.stringify(found0));
+    await execJs(EL0 + ` if(el) el.scrollIntoView({block:'center',behavior:'instant'}); return 'ok';`, [found0.marker]);
+    await new Promise((r) => setTimeout(r, 150));
+    let via;
+    const primary = found0.labelMarker || found0.marker;
+    try {
+      const el = await findEl(markerRef(primary));
+      await M.cmd('WebDriver:ElementClick', { id: el });
+      via = found0.labelMarker ? 'label' : 'element';
+    } catch (e) {
+      if (!found0.labelMarker) throw e;
+      const el = await findEl(markerRef(found0.marker));
+      await M.cmd('WebDriver:ElementClick', { id: el });
+      via = 'element( fallback )';
+    }
+    await new Promise((r) => setTimeout(r, 300));
+    const after = await execJs(ANSWER_FIND_JS, [a.question, a.choice, true]);
+    const state = after && after.option === found0.option ? after.state : 'unreadable';
+    let verified;
+    if (state === 'on') verified = 'selected';
+    else if (state === 'off') verified = 'NOT-SELECTED — click may have toggled it off; verify';
+    else verified = 'no selection signal on this control type — verify (e.g. re-run fx_form)';
+    return { ok: state !== 'off', question: found0.ctx, answer: found0.option, via, state: state === 'unreadable' ? 'unknown' : state, verified };
+  }),
+  T('fx_scroll', 'Scroll an element (ref from fx_snapshot, or selector) into view so it is not obscured (e.g. by a fixed header/cookie bar), wait, and return its top coordinate. Use before clicking elements that failed as "not clickable because another element obscures it".', { ref: { type: 'number' }, selector: { type: 'string' }, pos: { type: 'string', description: 'start | center | end (default center)' }, wait_ms: { type: 'number', description: 'wait after scroll (default 400, max 2000)' } }, async (a) => {
+    const mk = refMarker(a);
+    const pos = a.pos === 'start' || a.pos === 'end' ? a.pos : 'center';
+    const r = await execJs(EL0 + ` if(!el) return 'el-gone'; el.scrollIntoView({block:arguments[1],behavior:'instant'}); return 'ok:'+Math.round(el.getBoundingClientRect().top);`, [mk, pos]);
+    if (r === 'el-gone') throw new Error('element not found');
+    await new Promise((r2) => setTimeout(r2, Math.min(2000, Math.max(0, Number(a.wait_ms) || 400))));
+    return { r };
   }),
   T('fx_eval', 'Execute JS in the page (script = function body, may return a value)', { js: { type: 'string' } }, async (a) => {
     return { r: await execJs(a.js, []) };
