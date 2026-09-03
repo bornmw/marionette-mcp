@@ -140,7 +140,7 @@ function check(label, r, expect) {
 try {
   const list = await rpc('tools/list', {});
   const names = list.result.tools.map((t) => t.name);
-  check('tools/list: 22 tools incl. 4 form primitives', { result: { content: [{ text: names.join(',') }] } }, (t) => ['fx_form', 'fx_field', 'fx_answer', 'fx_scroll'].every((n) => t.includes(n)) && t.split(',').length === 22);
+  check('tools/list: 23 tools incl. 4 form primitives + fx_gates', { result: { content: [{ text: names.join(',') }] } }, (t) => ['fx_form', 'fx_field', 'fx_answer', 'fx_scroll', 'fx_gates'].every((n) => t.includes(n)) && t.split(',').length === 23);
 
   await call('fx_navigate', { url: 'file://' + TEST_HTML });
   await sleep(800);

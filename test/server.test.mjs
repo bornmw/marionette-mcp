@@ -81,8 +81,8 @@ test('initialize returns server identity and echoes protocol version', async () 
 test('tools/list exposes the full tool table', async () => {
   const r = await rpc({ jsonrpc: '2.0', id: 2, method: 'tools/list' });
   const names = r.result.tools.map((t) => t.name);
-  assert.equal(names.length, 22, names.join(','));
-  for (const n of ['fx_status', 'fx_navigate', 'fx_snapshot', 'fx_click', 'fx_type', 'fx_select', 'fx_toggle', 'fx_upload', 'fx_form', 'fx_field', 'fx_answer', 'fx_scroll', 'fx_eval', 'fx_wait', 'fx_screenshot', 'fx_cookies']) {
+  assert.equal(names.length, 23, names.join(','));
+  for (const n of ['fx_status', 'fx_navigate', 'fx_snapshot', 'fx_click', 'fx_type', 'fx_select', 'fx_toggle', 'fx_upload', 'fx_form', 'fx_field', 'fx_answer', 'fx_scroll', 'fx_gates', 'fx_eval', 'fx_wait', 'fx_screenshot', 'fx_cookies']) {
     assert.ok(names.includes(n), 'missing tool ' + n);
   }
   for (const t of r.result.tools) {
@@ -98,6 +98,13 @@ test('tools/list exposes the full tool table', async () => {
   assert.match(ff.description, /groups/i, 'fx_form documents choice-group aggregation');
   const fa = r.result.tools.find((t) => t.name === 'fx_answer');
   assert.match(fa.description, /toggle cycle/);
+  assert.match(fa.description, /self-heals/);
+  const fg = r.result.tools.find((t) => t.name === 'fx_gates');
+  assert.ok(fg, 'fx_gates tool present');
+  assert.match(fg.description, /consent/i);
+  assert.match(fg.description, /attestation/i);
+  const fc = r.result.tools.find((t) => t.name === 'fx_click');
+  assert.match(fc.description, /obscur/);
 });
 
 test('fx_status reaches the browser through the fake', async () => {
@@ -217,6 +224,90 @@ test('fx_screenshot writes a file under an allowed root', async () => {
 test('fx_wait on visible text resolves quickly', async () => {
   const r = await rpc({ jsonrpc: '2.0', id: 15, method: 'tools/call', params: { name: 'fx_wait', arguments: { text: 'anything', timeout_ms: 3000 } } });
   assert.match(toolText(r), /"ok": true/);
+});
+
+test('fx_answer self-heals to a wrapper click when option labels are unreadable (no-option)', async () => {
+  fake.state.answerFindSeq = [
+    { error: 'no-option', options: [''], ctx: 'Black or African AmericanOrigins in any of the Black racial groups of Africa.' },
+  ];
+  fake.state.answerFallback = { marker: 'xpath:/html/body/li[3]', text: 'I choose not to disclose', tag: 'LI' };
+  fake.state.answerReread = 'on';
+  const r = await rpc({ jsonrpc: '2.0', id: 40, method: 'tools/call', params: { name: 'fx_answer', arguments: { question: 'Black or African American', choice: 'I choose not to disclose' } } });
+  const t = toolText(r);
+  assert.match(t, /"ok": true/);
+  assert.match(t, /"fallback": true/);
+  assert.match(t, /fallback:LI/);
+  assert.match(t, /wrapper fallback/);
+  const nBefore = fake.state.frames.filter((f) => f[2] === 'WebDriver:ElementClick').length;
+  assert.ok(nBefore >= 1, 'fallback click went through the real driver');
+});
+
+test('fx_answer surfaces a fallback failure instead of a raw no-option error', async () => {
+  fake.state.answerFindSeq = [{ error: 'no-option', options: [], ctx: 'some question' }];
+  fake.state.answerFallback = { error: 'no-fallback-option' };
+  const r = await rpc({ jsonrpc: '2.0', id: 41, method: 'tools/call', params: { name: 'fx_answer', arguments: { question: 'some question', choice: 'Nope' } } });
+  const txt = toolErr(r, /no-option/);
+  assert.match(txt, /no-fallback-option/);
+});
+
+test('fx_answer on a readable group still uses the primary path (no fallback)', async () => {
+  fake.state.answerFindSeq = [
+    { ctx: 'q', option: 'Yes', kind: 'input', marker: 'xpath:/html/body/input[9]', state: 'off', single: true, alts: [], options: ['Yes', 'No'] },
+    { ctx: 'q', option: 'Yes', kind: 'input', marker: 'xpath:/html/body/input[9]', state: 'on', single: true, alts: [], options: ['Yes', 'No'] },
+  ];
+  const r = await rpc({ jsonrpc: '2.0', id: 42, method: 'tools/call', params: { name: 'fx_answer', arguments: { question: 'q', choice: 'Yes' } } });
+  const t = toolText(r);
+  assert.match(t, /"ok": true/);
+  assert.doesNotMatch(t, /"fallback": true/);
+  assert.match(t, /"via": "element"/);
+});
+
+test('fx_click retries on the obscuring topmost element of the same widget', async () => {
+  fake.state.clickFailOnce = true;
+  fake.state.clickTop = { mode: 'ancestor', marker: 'xpath:/html/body/div[1]' };
+  const r = await rpc({ jsonrpc: '2.0', id: 43, method: 'tools/call', params: { name: 'fx_click', arguments: { selector: '#go' } } });
+  const t = toolText(r);
+  assert.match(t, /"ok": true/);
+  assert.match(t, /overlay-top:ancestor/);
+  const clicks = fake.state.frames.filter((f) => f[2] === 'WebDriver:ElementClick');
+  assert.ok(clicks.length >= 2, 'original click + topmost retry');
+});
+
+test('fx_click reports a blocked topmost element with an actionable hint', async () => {
+  fake.state.clickFailOnce = true;
+  fake.state.clickTop = { mode: 'blocked', top: 'DIV.modal-backdrop' };
+  const r = await rpc({ jsonrpc: '2.0', id: 44, method: 'tools/call', params: { name: 'fx_click', arguments: { selector: '#go' } } });
+  const txt = toolErr(r, /topmost: DIV\.modal-backdrop/);
+  assert.match(txt, /fx_scroll|fx_eval/);
+});
+
+test('fx_click rethrows non-obscuring click errors unchanged', async () => {
+  fake.state.clickErrorOnce = 'Message: something else entirely';
+  const r = await rpc({ jsonrpc: '2.0', id: 45, method: 'tools/call', params: { name: 'fx_click', arguments: { selector: '#go' } } });
+  toolErr(r, /something else entirely/);
+});
+
+test('fx_gates reports consent checkboxes, disabled buttons, and banners', async () => {
+  fake.state.gates = {
+    boxes: [
+      { i: 1, checked: false, req: 0, gate: 1, text: 'I hereby certify that, to the best of my knowledge, the provided information is true and accurate.', m: 'xpath:/html/body/input[1]' },
+      { i: 2, checked: false, req: 0, gate: 0, text: 'Subscribe to newsletter', m: 'xpath:/html/body/input[2]' },
+      { i: 3, checked: true, req: 0, gate: 1, text: 'I agree to the terms of service.', m: 'xpath:/html/body/input[3]' },
+    ],
+    disabledButtons: [{ text: 'Apply', m: 'xpath:/html/body/button[9]' }],
+    banners: ['Attestation is required in order to continue'],
+  };
+  const r = await rpc({ jsonrpc: '2.0', id: 46, method: 'tools/call', params: { name: 'fx_gates', arguments: {} } });
+  const t = toolText(r);
+  assert.match(t, /"uncheckedConsent"/);
+  assert.match(t, /hereby certify/i);
+  assert.match(t, /"checkedConsent"/);
+  assert.match(t, /terms of service/i);
+  assert.match(t, /"otherUnchecked"/);
+  assert.match(t, /newsletter/i);
+  assert.match(t, /"disabledButtons"/);
+  assert.match(t, /"text": "Apply"/);
+  assert.match(t, /Attestation is required/);
 });
 
 test('unknown tool and unknown method produce isError results', async () => {

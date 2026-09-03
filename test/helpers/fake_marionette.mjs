@@ -78,6 +78,9 @@ function respond(id, name, params, state) {
     case 'WebDriver:Navigate': return [1, id, null, {}];
     case 'WebDriver:FindElement': return [1, id, null, { value: { [W3C_ELEMENT_KEY]: 'el-uuid-1' } }];
     case 'WebDriver:ElementClick':
+      if (state.clickErrorOnce) { const m = state.clickErrorOnce; state.clickErrorOnce = null; return [1, id, { error: 'invalid', message: m }, null]; }
+      if (state.clickFailOnce) { state.clickFailOnce = null; return [1, id, { error: 'element click intercepted', message: 'Message: Element <button class="x"> is not clickable at point (1188,362) because another element <div class="y"> obscures it' }, null]; }
+      return [1, id, null, {}];
     case 'WebDriver:ElementClear':
     case 'WebDriver:ElementSendKeys':
     case 'WebDriver:SwitchToWindow': return [1, id, null, {}];
@@ -104,6 +107,30 @@ function respond(id, name, params, state) {
         const sel = String((params && params.args && params.args[0]) || '');
         if (sel.includes(':has(')) return [1, id, null, { value: 'bad:SyntaxError: (fake) unsupported selector syntax' }];
         return [1, id, null, { value: 'ok' }];
+      }
+      // fx_answer main lookup (sentinel __answerfind__): scripted per-test via
+      // state.answerFindSeq (array of payload objects, shifted per call).
+      if (s.includes('__answerfind__')) {
+        const seq = state.answerFindSeq;
+        if (seq && seq.length) return [1, id, null, { value: seq.shift() }];
+        return [1, id, null, { value: { error: 'no-choice-controls' } }];
+      }
+      // fx_answer wrapper fallback (sentinel __answerfallback__)
+      if (s.includes('__answerfallback__')) {
+        return [1, id, null, { value: state.answerFallback || { error: 'no-fallback-option' } }];
+      }
+      // fx_answer state re-read after fallback click (sentinel __answerreread__)
+      if (s.includes('__answerreread__')) {
+        return [1, id, null, { value: state.answerReread || 'unknown' }];
+      }
+      // fx_click obscuring hit-test (sentinel __clicktop__)
+      if (s.includes('__clicktop__')) {
+        return [1, id, null, { value: state.clickTop || { mode: 'clear' } }];
+      }
+      // fx_gates (sentinel __gates__)
+      if (s.includes('__gates__')) {
+        const g = state.gates || { boxes: [], disabledButtons: [], banners: [] };
+        return [1, id, null, { value: g }];
       }
       if (s.includes('JSON.stringify({webdriver')) {
         const v = JSON.stringify({ webdriver: false, url: 'https://fake.test/', title: 'Fake Page', ready: 'complete' });

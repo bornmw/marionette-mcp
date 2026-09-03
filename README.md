@@ -75,7 +75,7 @@ Then the `fx_*` tools are available in-session. Typical flow:
 4. Forms: `fx_form` → field map (index/label/context/value), then `fx_field` (set by index/id/label) and `fx_answer` (Yes/No or radio/checkbox questions by question text + option label); `fx_scroll` before clicking elements obscured by fixed headers
 5. `fx_wait` for the next state; `fx_screenshot` + your own vision pass to verify what the DOM can't
 
-Form-tool gotchas (from live ATS/portal forms): re-renders can silently drop checked boxes — re-verify all fields after any state change; a free-text location field is often separate from a city checkbox group; required radio groups are sometimes not wrapped in labeled field containers — audit `fx_form.groups` (and a final screenshot) instead of assuming the labeled fields are the whole form; DOM `checked` ≠ the framework's form state — trust the tools' `confirmed`/`verified` output (a stale pre-selected option is the classic failure: `fx_answer` handles it via the toggle cycle).
+Form-tool gotchas (from live ATS/portal forms): re-renders can silently drop checked boxes — re-verify all fields after any state change; a free-text location field is often separate from a city checkbox group; required radio groups are sometimes not wrapped in labeled field containers — audit `fx_form.groups` (and a final screenshot) instead of assuming the labeled fields are the whole form; DOM `checked` ≠ the framework's form state — trust the tools' `confirmed`/`verified` output (a stale pre-selected option is the classic failure: `fx_answer` handles it via the toggle cycle). Long application forms (e.g. Google) hide mandatory **consent/attestation checkboxes** ("…hereby certify that…", "I understand that the information I submit…") that gate the whole submit/apply: the button is left hard-disabled or the click silently no-ops until the box is ticked — that is client-side enablement, **not** bot protection; `fx_gates` surfaces these boxes (plus the disabled button and any alert banner) so you can find and check the actual gate. Material-style rows put the real `<input>` visually hidden under its own `li`/button chrome, so a direct input click can be reported "not clickable … obscured" — `fx_click`/`fx_field`/`fx_answer` recover by clicking the obscuring same-widget topmost and report it via `overlay-top:…`.
 
 ## Tools
 
@@ -85,15 +85,16 @@ Form-tool gotchas (from live ATS/portal forms): re-renders can silently drop che
 | `fx_navigate` | Go to a URL |
 | `fx_page` | Current URL + title |
 | `fx_snapshot` | Interactive-element map with refs (incl. visible `label` text when present) |
-| `fx_click` | Click (ref or selector; digit-leading `#id` auto-rewritten to `[id="…"]`, unsupported CSS caught in-page) |
+| `fx_click` | Click (ref or selector; digit-leading `#id` auto-rewritten to `[id="…"]`, unsupported CSS caught in-page). If the element is not clickable because another element obscures it and the obscuring element belongs to the same widget (Material button chrome, an `li`/`label` over a hidden input), the obscuring topmost is clicked instead and reported as `via: "overlay-top:…"`; a foreign blocker is reported with its identity |
 | `fx_type` | Type text (clears first unless `keep: true`; same selector hardening) |
 | `fx_select` | Set `<select>` by option value or label |
 | `fx_toggle` | Set checkbox/radio state |
 | `fx_upload` | Set file input (raw path, must be under `FX_MCP_FILE_ROOTS`) |
 | `fx_form` | Dump visible form fields: index, type, label, name, context, value, options, files + aggregated choice groups (question context, per-option state); scopes to a CSS `root` |
 | `fx_field` | Set a field by index (from `fx_form`), id, or label substring: real keystrokes for text, verified real click (with fallbacks) for checkbox/radio, option match for select |
-| `fx_answer` | Answer a grouped choice question (Yes/No buttons, radio/checkbox options) by question text + option label; re-reads and reports the selection state; runs a toggle cycle on exclusive groups when a stale pre-selection (or ineffective click) is detected |
+| `fx_answer` | Answer a grouped choice question (Yes/No buttons, radio/checkbox options) by question text + option label; re-reads and reports the selection state; runs a toggle cycle on exclusive groups when a stale pre-selection (or ineffective click) is detected; self-heals to clicking the visible text-matching wrapper when option labels are unreadable (`no-option`, e.g. label-less `li` rows) |
 | `fx_scroll` | Scroll an element into view (e.g. under a fixed header), wait, return its top coordinate |
+| `fx_gates` | Consent/attestation gate audit (read-only): visible checkboxes with nearby text — flagging certify/understand/agree/consent/attest/terms/privacy wording — plus disabled buttons (a dead Submit/Apply) and visible alert banners. Run it whenever a submit click does nothing or a submit button stays disabled; the fix is usually an unchecked consent checkbox, not bot protection |
 | `fx_eval` | Run JS in the page (function body; `return` your value — a returned Promise is awaited, default 30 s via `wait_ms`) |
 | `fx_wait` | Wait for visible text or CSS selector (≤ 30 s) |
 | `fx_screenshot` | Full-page PNG (not just the viewport) to a file under an allowed root |

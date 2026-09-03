@@ -94,6 +94,36 @@ try { document.querySelector(arguments[0]); return 'ok'; } catch (e) { return 'b
   }
 }
 
+// Hit-test probe for the fx_click obscuring fallback: sample points inside the
+// target's box and inspect what elementFromPoint returns at the first hit.
+//   clear    — the target (or its descendant) is on top: the driver click should work
+//   ancestor — a same-widget ancestor sits on top (Material button overlay, an
+//              li/label over a visually-hidden input): return ITS marker
+//   widget   — a sibling/overlay inside the closest common widget: return ITS marker
+//   blocked  — unrelated element on top: report it
+const CLICK_TOP_JS = `/*__clicktop__*/
+const s=arguments[0]; const el=(s.indexOf('xpath:')===0)?document.evaluate(s.slice(6),document,null,9,null).singleNodeValue:document.querySelector(s);
+if(!el) return { error: 'el-gone' };
+var r=el.getBoundingClientRect();
+var pts=[[.5,.5],[.3,.5],[.7,.5],[.5,.35],[.5,.65],[.3,.35],[.7,.65],[.5,.8],[.5,.2]];
+function wOf(n){ return n && n.closest ? n.closest('button,[role=button],label,li,a,select') : null; }
+for(var i=0;i<pts.length;i++){
+  var x=r.left+r.width*pts[i][0], y=r.top+r.height*pts[i][1];
+  var top=document.elementFromPoint(x,y);
+  if(!top) continue;
+  if(top===el || el.contains(top)) return { mode: 'clear' };
+  if(top.contains(el)){
+    var w1=wOf(el), w2=wOf(top);
+    if(!w1 || !w2 || w1===w2 || w2.contains(w1)) return { mode: 'ancestor', marker: (top.id?'#'+CSS.escape(top.id):'xpath:'+__xp(top)) };
+    return { mode: 'blocked', top: (top.tagName||'?')+'.'+String(top.className||'').slice(0,60) };
+  }
+  var w1b=wOf(el), w2b=wOf(top);
+  if(w1b && w2b && w1b===w2b) return { mode: 'widget', marker: (top.id?'#'+CSS.escape(top.id):'xpath:'+__xp(top)) };
+  return { mode: 'blocked', top: (top.tagName||'?')+'.'+String(top.className||'').slice(0,60) };
+}
+return { mode: 'blocked', hint: 'no sample point resolved' };
+`;
+
 // Two-phase fx_eval: the wrapper runs the user body synchronously in-page and
 // reports {ok|err|pend}; a pending Promise settles into window.__fxr and is
 // polled, so `return (async () => { … })()` bodies can be awaited.
@@ -203,7 +233,7 @@ return (function(){
   var max=Number(arguments[0])||80, only=Number(arguments[1])||0, id=arguments[2]||'', lq=(arguments[3]||'').toLowerCase(), rc=arguments[4]||'';
   function norm(s){ return (s==null?'':String(s)).trim().replace(/\\s+/g,' '); }
   function vis(el){ var r=el.getBoundingClientRect(); return r.width>0 && r.height>0 && el.type!=='hidden' && (el.offsetParent!==null || el.getClientRects().length>0); }
-  function labelOf(el){ if(el.id){ var l=document.querySelector('label[for="'+CSS.escape(el.id)+'"]'); if(l && norm(l.textContent)) return norm(l.textContent).slice(0,120); } var wl=el.closest?el.closest('label'):null; if(wl){ var wt=norm(wl.textContent); if(wt) return wt.slice(0,120); } var al=el.getAttribute('aria-label'); if(al && norm(al)) return norm(al).slice(0,120); return ''; }
+  function labelOf(el){ if(el.id){ var l=document.querySelector('label[for="'+CSS.escape(el.id)+'"]'); if(l && norm(l.textContent)) return norm(l.textContent).slice(0,120); } var wl=el.closest?el.closest('label'):null; if(wl){ var wt=norm(wl.textContent); if(wt) return wt.slice(0,120); } var al=el.getAttribute('aria-label'); if(al && norm(al)) return norm(al).slice(0,120); if(el.type==='radio'||el.type==='checkbox'){ var w=el.parentElement, g=0; while(w && g<6){ var n=w.querySelectorAll?w.querySelectorAll('input[type=radio],input[type=checkbox]').length:99; var t=norm(w.textContent); if(n===1 && t.length>=2 && t.length<=160) return t.slice(0,120); w=w.parentElement; g++; } } return ''; }
   function ctxOf(el){ var t=el.parentElement, g=0; while(t && g<7){ var c=norm(t.textContent); if(c.length>=15 && c.length<=600) return c.slice(0,160); t=t.parentElement; g++; } return ''; }
   function markerOf(el){ if(el.id){ var m='#'+CSS.escape(el.id); try{ if(document.querySelector(m)===el) return m; }catch(e){} } return 'xpath:'+__xp(el); }
     var scope = rc ? (document.querySelector(rc) || document) : document;
@@ -236,13 +266,13 @@ return (function(){
 
 // Locate one choice group by question text and pick an option. args: [question, choice, exact]
 // Returns: {ctx, option, kind, marker, labelMarker, state, options[]} or {error, ...}
-const ANSWER_FIND_JS = XP_JS + `
+const ANSWER_FIND_JS = XP_JS + `/*__answerfind__*/
 return (function(){
   var Q=(arguments[0]||'').toLowerCase(), C=arguments[1]||'', exact=!!arguments[2];
   function norm(s){ return (s==null?'':String(s)).trim().replace(/\\s+/g,' '); }
   function vis(el){ var r=el.getBoundingClientRect(); return r.width>0 && r.height>0 && el.offsetParent!==null; }
   function ctxOf(el){ var t=el.parentElement, g=0; while(t && g<8){ var c=norm(t.textContent); if(c.length>=15 && c.length<=800) return c.slice(0,240); t=t.parentElement; g++; } return ''; }
-  function labelOf(el){ if(el.id){ var l=document.querySelector('label[for="'+CSS.escape(el.id)+'"]'); if(l && norm(l.textContent)) return norm(l.textContent); } var wl = el.closest ? el.closest('label') : null; if(wl){ var wt = norm(wl.textContent); if(wt) return wt; } var al=el.getAttribute('aria-label'); if(al) return norm(al); if(el.tagName==='BUTTON') return norm(el.textContent); return ''; }
+  function labelOf(el){ if(el.id){ var l=document.querySelector('label[for="'+CSS.escape(el.id)+'"]'); if(l && norm(l.textContent)) return norm(l.textContent); } var wl = el.closest ? el.closest('label') : null; if(wl){ var wt = norm(wl.textContent); if(wt) return wt; } var al=el.getAttribute('aria-label'); if(al) return norm(al); if(el.tagName==='BUTTON') return norm(el.textContent); if(el.type==='radio'||el.type==='checkbox'){ var w=el.parentElement, g=0; while(w && g<6){ var n=w.querySelectorAll?w.querySelectorAll('input[type=radio],input[type=checkbox]').length:99; var t=norm(w.textContent); if(n===1 && t.length>=2 && t.length<=160) return t; w=w.parentElement; g++; } } return ''; }
   function markerOf(el){ if(el.id){ var m='#'+CSS.escape(el.id); try{ if(document.querySelector(m)===el) return m; }catch(e){} } return 'xpath:'+__xp(el); }
   function selState(el){ if(el.type==='checkbox'||el.type==='radio') return el.checked?'on':'off'; var ap=el.getAttribute('aria-pressed'); if(ap!=null) return ap==='true'?'on':'off'; return 'unknown'; }
   var cands=[];
@@ -269,9 +299,136 @@ return (function(){
 })(arguments[0], arguments[1], arguments[2]);
 `;
 
+// Fallback for fx_answer when the group's option LABELS are not readable by
+// ANSWER_FIND_JS (unlabeled checkbox/radio rows rendered as plain li/label rows
+// with no label association): find a VISIBLE wrapper (li/label/[role=option]/
+// button) whose text matches the choice, scoped to the question's context, and
+// return its marker so the caller can issue a real click on the wrapper.
+const ANSWER_FALLBACK_JS = XP_JS + `/*__answerfallback__*/
+return (function(){
+  var Q=(arguments[0]||'').toLowerCase(), C=(arguments[1]||'').trim();
+  function norm(s){ return (s==null?'':String(s)).trim().replace(/\\s+/g,' '); }
+  function vis(el){ var r=el.getBoundingClientRect(); return r.width>0 && r.height>0 && (el.offsetParent!==null || el.getClientRects().length>0); }
+  function ctxOf(el){ var t=el.parentElement, g=0; while(t && g<8){ var c=norm(t.textContent); if(c.length>=15 && c.length<=800) return c.slice(0,240); t=t.parentElement; g++; } return ''; }
+  function markerOf(el){ if(el.id){ var m='#'+CSS.escape(el.id); try{ if(document.querySelector(m)===el) return m; }catch(e){} } return 'xpath:'+__xp(el); }
+  var cl=C.toLowerCase();
+  var cands=[];
+  document.querySelectorAll('li,label,[role=option],button').forEach(function(w){
+    if(!vis(w)) return;
+    var t=norm(w.textContent);
+    if(t.length<2 || t.length>160) return;
+    var tl=t.toLowerCase();
+    if(tl!==cl && tl.indexOf(cl)<0) return;
+    var ctl = (w.tagName==='BUTTON' || w.hasAttribute('role')) ? w : w.querySelector('input[type=radio],input[type=checkbox],[role=radio],[role=checkbox]');
+    if(!ctl) return;
+    var ctx=ctxOf(w);
+    if(Q && ctx.toLowerCase().indexOf(Q)<0) return;
+    cands.push({ w: w, t: t });
+  });
+  if(!cands.length) return { error: 'no-fallback-option' };
+  cands.sort(function(a,b){ var ae=a.t.toLowerCase()===cl?0:1, be=b.t.toLowerCase()===cl?0:1; if(ae!==be) return ae-be; return a.t.length-b.t.length; });
+  if(cands.length>1 && cands[0].t.toLowerCase()!==cl && cands[1].t.toLowerCase()===cl) return { error: 'no-fallback-option' };
+  if(cands.length>1 && cands[0].t.toLowerCase()!==cl) return { error: 'ambiguous-fallback', matches: cands.slice(0,4).map(function(c){ return c.t.slice(0,60); }) };
+  var first=cands[0];
+  return { marker: markerOf(first.w), text: first.t.slice(0,80), tag: first.w.tagName.toLowerCase() };
+})(arguments[0], arguments[1]);
+`;
+
+// Re-read the selection state of a (fallback) wrapper after clicking it.
+const ANSWER_REREAD_JS = `/*__answerreread__*/
+return (function(m){
+  var el = (m && m.indexOf('xpath:')===0) ? document.evaluate(m.slice(6),document,null,9,null).singleNodeValue : document.querySelector(m);
+  if(!el) return 'gone';
+  var inp = el.tagName==='BUTTON' ? el : el.querySelector('input[type=radio],input[type=checkbox]');
+  if(inp && (inp.type==='radio' || inp.type==='checkbox')) return inp.checked ? 'on' : 'off';
+  var ap=el.getAttribute('aria-pressed'); if(ap!=null) return ap==='true'?'on':'off';
+  var ac=el.getAttribute('aria-checked'); if(ac!=null) return ac==='true'?'on':'off';
+  return 'unknown';
+})(arguments[0]);
+`;
+
+// Consent/attestation gate audit (fx_gates): visible checkboxes with their
+// nearby text, consent-pattern flags (certify/understand/agree/consent/attest/
+// terms/privacy/acknowledge), disabled buttons (dead Submit/Apply), and visible
+// alert-style banners. Read-only; built for the "submit click does nothing" case.
+const GATES_JS = XP_JS + `/*__gates__*/
+return (function(){
+  function norm(s){ return (s==null?'':String(s)).trim().replace(/\\s+/g,' '); }
+  function vis(el){ var r=el.getBoundingClientRect(); return r.width>0 && r.height>0 && (el.offsetParent!==null || el.getClientRects().length>0); }
+  function markerOf(el){ if(el.id){ var m='#'+CSS.escape(el.id); try{ if(document.querySelector(m)===el) return m; }catch(e){} } return 'xpath:'+__xp(el); }
+  var GATE=/certif|understand|agree|consent|attest|terms|privacy|acknowledge/i;
+  function textOf(el){
+    var lbl='';
+    if(el.id){ var l=document.querySelector('label[for="'+CSS.escape(el.id)+'"]'); if(l && norm(l.textContent)) lbl=norm(l.textContent); }
+    if(!lbl){ var wl=el.closest?el.closest('label'):null; if(wl && norm(wl.textContent)) lbl=norm(wl.textContent); }
+    if(!lbl){ var w=el.parentElement, g=0; while(w && g<5){ var n=w.querySelectorAll('input[type=checkbox]').length; var t=norm(w.textContent); if(n<=1 && t.length>=2 && t.length<=240) { lbl=t; break; } w=w.parentElement; g++; } }
+    if(!lbl){ var al=el.getAttribute('aria-label'); if(al) lbl=norm(al); }
+    return lbl;
+  }
+  var boxes=[];
+  document.querySelectorAll('input[type=checkbox]').forEach(function(el){
+    if(!vis(el)) return;
+    var t=textOf(el);
+    boxes.push({ i: boxes.length+1, checked: el.checked===true, req: el.required?1:0, gate: GATE.test(t)?1:0, text: t.slice(0,200), m: markerOf(el) });
+  });
+  document.querySelectorAll('[role=checkbox]').forEach(function(el){
+    if(!vis(el)) return;
+    var t=norm(el.textContent);
+    boxes.push({ i: boxes.length+1, checked: el.getAttribute('aria-checked')==='true', req: 0, gate: GATE.test(t)?1:0, text: t.slice(0,200), m: markerOf(el), role: 1 });
+  });
+  if(boxes.length>25) boxes=boxes.slice(0,25);
+  var dis=[];
+  document.querySelectorAll('button,[role=button]').forEach(function(el){
+    if(!vis(el)) return;
+    if(!(el.disabled===true || el.getAttribute('aria-disabled')==='true')) return;
+    var t=norm(el.textContent);
+    if(t.length<3) return;
+    dis.push({ text: t.slice(0,60), m: markerOf(el) });
+  });
+  if(dis.length>10) dis=dis.slice(0,10);
+  var banners=[];
+  document.querySelectorAll('[role=alert],[class*=toast],[class*=banner],[class*=notification],[class*=snackbar]').forEach(function(el){
+    if(!vis(el)) return;
+    var t=norm(el.textContent);
+    if(t.length<4 || t.length>300) return;
+    if(!banners.some(function(b){ return b===t.slice(0,120); })) banners.push(t.slice(0,200));
+  });
+  if(banners.length>8) banners=banners.slice(0,8);
+  return { boxes: boxes, disabledButtons: dis, banners: banners };
+})()
+`;
+
 function markerRef(marker) {
   if (marker.startsWith('xpath:')) return { using: 'xpath', value: marker.slice(6) };
   return { using: 'css selector', value: marker };
+}
+
+// Real (driver) click on the element behind a marker ('#id' or 'xpath:…'). If
+// the driver reports the element as NOT CLICKABLE (obscured) — the Material
+// pattern of a visually-hidden input / transparent button under its own widget
+// chrome — hit-test the obscuring topmost in-page; when it belongs to the same
+// widget, click that instead. Non-obscuring errors rethrow unchanged.
+async function clickVia(marker) {
+  const el = await findEl(markerRef(marker));
+  try {
+    await M.cmd('WebDriver:ElementClick', { id: el });
+    return { el, mode: 'direct' };
+  } catch (e) {
+    const msg = String((e && e.message) || e);
+    if (!/obscures|not clickable/i.test(msg)) throw e;
+    const top = await execJs(XP_JS + CLICK_TOP_JS, [marker]);
+    if (top && (top.mode === 'ancestor' || top.mode === 'widget') && top.marker) {
+      try {
+        const tel = await findEl(markerRef(top.marker));
+        await M.cmd('WebDriver:ElementClick', { id: tel });
+        return { el: tel, mode: top.mode, top };
+      } catch { /* fall through: report the original */ }
+    }
+    if (top && top.mode === 'blocked') {
+      throw new Error(msg + ' · topmost: ' + (top.top || top.hint || 'unknown') + ' — fx_scroll it into view, or click the wrapper via an fx_eval marker');
+    }
+    throw e;
+  }
 }
 function fmtField(f) {
   return { i: f.i, type: f.tag === 'select' ? 'select' : (f.type || f.tag), label: (f.label || f.ph || f.id || 'field-' + f.i).slice(0, 80) };
@@ -296,12 +453,15 @@ const TOOLS = [
   T('fx_snapshot', 'Interactive-element map with refs (use refs in fx_click/fx_type/...)', {}, async () => {
     return fmtSnapshot(await execJs(SNAPSHOT_JS));
   }),
-  T('fx_click', 'Click element by ref (from fx_snapshot) or CSS selector. Digit-leading ids: use [id="…"] form (a bare #1abc is not valid CSS) — or pass it as-is and the tool will rewrite it for you. Unsupported CSS (e.g. :has()) is caught in-page with an actionable error before the driver call.', { ref: { type: 'number' }, selector: { type: 'string' } }, async (a) => {
+  T('fx_click', 'Click element by ref (from fx_snapshot) or CSS selector. Digit-leading ids: use [id="…"] form (a bare #1abc is not valid CSS) — or pass it as-is and the tool will rewrite it for you. Unsupported CSS (e.g. :has()) is caught in-page with an actionable error before the driver call. If the element is obscured by an overlay of its own widget (Material button chrome, an li/label over a hidden input), the obscuring topmost element is clicked instead and reported as used:"overlay-top:…".', { ref: { type: 'number' }, selector: { type: 'string' } }, async (a) => {
     const p = resolveElRef(a);
     if (p.using === 'css selector') { p.value = hardenCss(p.value); await checkCss(p.value); }
-    const el = await findEl(p.using, p.value);
-    await M.cmd('WebDriver:ElementClick', { id: el });
-    return { ok: true, el, used: a.selector && p.value !== a.selector ? p.value : undefined };
+    await findEl(p.using, p.value); // resolve early: actionable error for bad selectors
+    const c = await clickVia(refMarker(a));
+    const out = { ok: true, el: c.el };
+    if (a.selector && p.value !== a.selector) out.used = p.value;
+    if (c.mode !== 'direct') out.via = 'overlay-top:' + c.mode;
+    return out;
   }),
   T('fx_type', 'Type text into element (clears first unless keep=true). Same selector rules as fx_click (digit-leading #ids auto-rewritten to [id="…"]; unsupported CSS caught in-page).', { ref: { type: 'number' }, selector: { type: 'string' }, text: { type: 'string' }, keep: { type: 'boolean', description: 'true = append instead of clearing' } }, async (a) => {
     const p = resolveElRef(a);
@@ -403,9 +563,8 @@ const TOOLS = [
       if ((cur === 'true') === want) return { ok: true, unchanged: true, field: fmtField(field), state: want ? 'on' : 'off' };
       let via = 'none';
       try {
-        const el = await findEl(ref);
-        await M.cmd('WebDriver:ElementClick', { id: el });
-        via = 'element';
+        const c = await clickVia(field.m);
+        via = c.mode === 'direct' ? 'element' : 'overlay-top:' + c.mode;
       } catch {
         const lm = await execJs(EL0 + ` if(!el||!el.id) return null; const l=document.querySelector('label[for="'+CSS.escape(el.id)+'"]'); if(!l) return null; if(l.id){ try{ const m='#'+CSS.escape(l.id); if(document.querySelector(m)===l) return m; }catch(e){} } return 'xpath:'+__xp(l);`, [field.m]);
         if (lm && lm !== 'null') {
@@ -436,25 +595,40 @@ const TOOLS = [
     const conf = await execJs(EL0 + ` return el?String(el.value):'gone';`, [field.m]);
     return { ok: conf !== 'gone' && (a.value == null || conf === String(a.value)), field: fmtField(field), confirmed: conf.slice(0, 120) };
   }),
-  T('fx_answer', 'Answer a grouped choice question (Yes/No button groups, radio or checkbox option groups): locate the group by matching the question text, pick the option by its label, perform a real click, then re-read and report the resulting selection state. If the target was already selected (or is still not selected) after the click — a no-op click that frameworks often do not register — performs a toggle cycle (click another option, then the target) on exclusive groups and re-verifies. Use this instead of clicking raw button refs — option order/refs can shift on re-render, and matching by question text prevents picking the wrong option of a neighbouring question.', { question: { type: 'string', description: 'text that must appear in the question context' }, choice: { type: 'string', description: 'option label to select, e.g. "Yes" or "New York City"' }, exact: { type: 'boolean', description: 'require exact label match (default false: case-insensitive substring allowed)' } }, async (a) => {
+  T('fx_answer', 'Answer a grouped choice question (Yes/No button groups, radio or checkbox option groups): locate the group by matching the question text, pick the option by its label, perform a real click, then re-read and report the resulting selection state. If the target was already selected (or is still not selected) after the click — a no-op click that frameworks often do not register — performs a toggle cycle (click another option, then the target) on exclusive groups and re-verifies. If the option labels are unreadable (label-less li/label rows), it self-heals by clicking the visible wrapper whose text matches the choice. Use this instead of clicking raw button refs — option order/refs can shift on re-render, and matching by question text prevents picking the wrong option of a neighbouring question.', { question: { type: 'string', description: 'text that must appear in the question context' }, choice: { type: 'string', description: 'option label to select, e.g. "Yes" or "New York City"' }, exact: { type: 'boolean', description: 'require exact label match (default false: case-insensitive substring allowed)' } }, async (a) => {
     if (!a.question || !a.choice) throw new Error('need question + choice');
-    const found0 = await execJs(ANSWER_FIND_JS, [a.question, a.choice, a.exact !== true]);
-    if (!found0 || typeof found0 !== 'object' || !found0.marker) throw new Error('fx_answer: ' + JSON.stringify(found0));
+    let found0 = await execJs(ANSWER_FIND_JS, [a.question, a.choice, a.exact !== true]);
+    if (!found0 || typeof found0 !== 'object' || !found0.marker) {
+      // Self-heal: option label unreadable (unassociated li/label rows) — click the
+      // visible wrapper whose text matches the choice, scoped to the question context.
+      const err = found0 && found0.error;
+      if (err !== 'no-option') throw new Error('fx_answer: ' + JSON.stringify(found0));
+      const fb = await execJs(ANSWER_FALLBACK_JS, [a.question, a.choice]);
+      if (!fb || !fb.marker) throw new Error('fx_answer: ' + JSON.stringify(found0) + ' fallback: ' + JSON.stringify(fb));
+      await execJs(EL0 + ` if(el) el.scrollIntoView({block:'center',behavior:'instant'}); return 'ok';`, [fb.marker]);
+      await new Promise((r) => setTimeout(r, 150));
+      await clickVia(fb.marker);
+      await new Promise((r) => setTimeout(r, 400));
+      let st = await execJs(ANSWER_REREAD_JS, [fb.marker]);
+      if (st === 'gone') st = 'unknown';
+      const verified = st === 'on' ? 'selected (wrapper fallback)' : st === 'off' ? 'NOT-SELECTED — verify' : 'no selection signal on this control — verify (e.g. re-run fx_form)';
+      return { ok: st !== 'off', question: (found0.ctx || a.question), answer: fb.text, pre: null, via: 'fallback:' + fb.tag, state: st, verified, fallback: true };
+    }
     const pre = found0.state;
     await execJs(EL0 + ` if(el) el.scrollIntoView({block:'center',behavior:'instant'}); return 'ok';`, [found0.marker]);
     await new Promise((r) => setTimeout(r, 150));
     let via;
     const primary = found0.labelMarker || found0.marker;
+    function viaOf(c, base) { return base + (c.mode !== 'direct' ? '+overlay' : ''); }
     async function clickPrimary(fallbackNote) {
+      const base = fallbackNote ? 'element(' + fallbackNote + ')' : (found0.labelMarker ? 'label' : 'element');
       try {
-        const el = await findEl(markerRef(primary));
-        await M.cmd('WebDriver:ElementClick', { id: el });
-        via = fallbackNote ? 'element(' + fallbackNote + ')' : (found0.labelMarker ? 'label' : 'element');
+        const c = await clickVia(primary);
+        via = viaOf(c, base);
       } catch (e) {
         if (!found0.labelMarker) throw e;
-        const el = await findEl(markerRef(found0.marker));
-        await M.cmd('WebDriver:ElementClick', { id: el });
-        via = 'element( fallback )';
+        const c = await clickVia(found0.marker);
+        via = viaOf(c, 'element( fallback )');
       }
     }
     await clickPrimary();
@@ -468,8 +642,7 @@ const TOOLS = [
       let toggled = false;
       for (const alt of found0.alts || []) {
         try {
-          const el = await findEl(markerRef(alt.marker));
-          await M.cmd('WebDriver:ElementClick', { id: el });
+          await clickVia(alt.marker);
           await new Promise((r) => setTimeout(r, 300));
           const mid = await execJs(ANSWER_FIND_JS, [a.question, a.choice, true]);
           if (mid && (mid.state !== pre || pre === 'unknown')) { toggled = true; break; }
@@ -495,6 +668,18 @@ const TOOLS = [
     if (r === 'el-gone') throw new Error('element not found');
     await new Promise((r2) => setTimeout(r2, Math.min(2000, Math.max(0, Number(a.wait_ms) || 400))));
     return { r };
+  }),
+  T('fx_gates', 'Consent/attestation gate audit: lists visible checkboxes with their nearby text (flags certify/understand/agree/consent/attest/terms/privacy wording — the hidden gates of long application forms), disabled buttons (a dead Submit/Apply), and visible alert-style banners. Read-only; run it whenever a submit click does nothing or a submit button is disabled — the fix is usually an unchecked consent checkbox, not bot protection.', {}, async () => {
+    const r = await execJs(GATES_JS, []);
+    if (!r || typeof r !== 'object' || !Array.isArray(r.boxes)) throw new Error('fx_gates: unexpected page result ' + typeof r);
+    const mk = (b) => ({ i: b.i, checked: !!b.checked, required: !!b.req, text: b.text, marker: b.m });
+    return {
+      uncheckedConsent: r.boxes.filter((b) => b.gate && !b.checked).map(mk),
+      checkedConsent: r.boxes.filter((b) => b.gate && b.checked).map(mk),
+      otherUnchecked: r.boxes.filter((b) => !b.gate && !b.checked).map(mk).slice(0, 15),
+      disabledButtons: (r.disabledButtons || []).map((b) => ({ text: b.text, marker: b.m })),
+      banners: r.banners || [],
+    };
   }),
   T('fx_eval', 'Execute JS in the page (script = function body, may return a value). Synchronous bodies behave as before ({r: value}). If the body returns a Promise — e.g. `return (async () => { … })()` after a fetch/timeout — the call awaits it (default max 30s, wait_ms to tune) and returns {r: value, awaited: true}; a rejected or long-unsettled Promise is an error.', { js: { type: 'string' }, wait_ms: { type: 'number', description: 'max wait for a Promise-returning body (default 30000, max 120000)' } }, async (a) => {
     const w = await execJs(EVAL_WRAP(String(a.js)), []);
