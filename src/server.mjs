@@ -9,6 +9,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { Marionette } from './marionette.mjs';
 import { unwrapElementRef } from './protocol.mjs';
+import { EVAL_WRAP, EVAL_POLL } from './evalwrap.mjs';
 
 const HOST = process.env.FX_MARIONETTE_HOST || '127.0.0.1';
 const PORT = Number(process.env.FX_MARIONETTE_PORT || 2828);
@@ -124,13 +125,9 @@ for(var i=0;i<pts.length;i++){
 return { mode: 'blocked', hint: 'no sample point resolved' };
 `;
 
-// Two-phase fx_eval: the wrapper runs the user body synchronously in-page and
-// reports {ok|err|pend}; a pending Promise settles into window.__fxr and is
-// polled, so `return (async () => { … })()` bodies can be awaited.
-const EVAL_WRAP = (body) =>
-  'var __r; try { __r = (function(){ ' + body + ' })(); } catch (e) { return { __fx: "err", m: String((e && e.message) || e) }; } if (__r && typeof __r.then === "function") { __r.then(function (v) { window.__fxr = { __fx: "ok", v: v }; }, function (e) { window.__fxr = { __fx: "err", m: String((e && e.message) || e) }; }); return { __fx: "pend" }; } return { __fx: "ok", v: __r }; /*__fxeval__*/';
-const EVAL_POLL = `/*__fxpoll__*/
-var __w = window.__fxr; if (__w) { delete window.__fxr; return __w; } return null;`;
+// Two-phase fx_eval: the wrapper (src/evalwrap.mjs) runs the user body in-page
+// (expression first, function-body fallback) and reports {ok|err|pend}; a
+// pending Promise settles into window.__fxr and is polled.
 
 function allowedPath(abs) {
   return FILE_ROOTS.some((r0) => abs === r0 || abs.startsWith(r0 + path.sep));
@@ -681,10 +678,10 @@ const TOOLS = [
       banners: r.banners || [],
     };
   }),
-  T('fx_eval', 'Execute JS in the page (script = function body, may return a value). Synchronous bodies behave as before ({r: value}). If the body returns a Promise — e.g. `return (async () => { … })()` after a fetch/timeout — the call awaits it (default max 30s, wait_ms to tune) and returns {r: value, awaited: true}; a rejected or long-unsettled Promise is an error.', { js: { type: 'string' }, wait_ms: { type: 'number', description: 'max wait for a Promise-returning body (default 30000, max 120000)' } }, async (a) => {
-    const w = await execJs(EVAL_WRAP(String(a.js)), []);
+  T('fx_eval', 'Execute JS in the page. `js` is tried as an EXPRESSION first — its completion value is returned, so `1 + 1`, `document.title`, `var x = 1; x`, `(async () => { … })()` and `fetch(u).then(r => r.json())` all work without `return`. If that fails with a SyntaxError (classic function-body style with a top-level `return`), it is re-run as a function body — so `return value` scripts work too. A rejected or Promise value is awaited (default max 30s, wait_ms to tune) and returned as {r: value, awaited: true}; a rejected or long-unsettled Promise is an error.', { js: { type: 'string' }, wait_ms: { type: 'number', description: 'max wait for a Promise-returning body (default 30000, max 120000)' } }, async (a) => {
+    const w = await execJs(EVAL_WRAP, [String(a.js)]);
     if (!w || typeof w !== 'object' || typeof w.__fx !== 'string') {
-      throw new Error('fx_eval: body must `return` a value (for async work: `return (async () => { … })()`); bare expression statements are discarded');
+      throw new Error('fx_eval: unexpected driver response (no eval wrapper tag)');
     }
     if (w.__fx === 'err') throw new Error('fx_eval page error: ' + (w.m || 'unknown'));
     if (w.__fx === 'ok') return { r: w.v };

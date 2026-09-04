@@ -1,6 +1,6 @@
 {
   "name": "marionette-mcp",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "Zero-dependency Model Context Protocol server that drives your own Firefox (user-launched, --marionette) via its native wire protocol: snapshot, click, type, upload, screenshot, JS eval.",
   "type": "module",
   "main": "src/server.mjs",
@@ -8,7 +8,7 @@
     "marionette-mcp": "src/server.mjs"
   },
   "scripts": {
-    "test": "node --test test/protocol.test.mjs test/marionette.test.mjs test/server.test.mjs",
+    "test": "node --test test/protocol.test.mjs test/marionette.test.mjs test/evalwrap.test.mjs test/server.test.mjs",
     "start": "node src/server.mjs",
     "e2e:live": "node scripts/e2e-live.mjs",
     "e2e:forms": "node scripts/e2e-forms.mjs",
