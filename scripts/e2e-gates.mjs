@@ -120,7 +120,7 @@ function check(label, r, expect) {
 try {
   const list = await rpc('tools/list', {});
   const names = list.result.tools.map((t) => t.name);
-  check('tools/list: 24 tools incl. fx_gates + fx_connect', { result: { content: [{ text: names.join(',') }] } }, (t) => ['fx_form', 'fx_field', 'fx_answer', 'fx_scroll', 'fx_gates', 'fx_connect'].every((n) => t.includes(n)) && t.split(',').length === 24);
+  check('tools/list: 27 tools incl. fx_gates + fx_connect + read tools', { result: { content: [{ text: names.join(',') }] } }, (t) => ['fx_form', 'fx_field', 'fx_answer', 'fx_scroll', 'fx_gates', 'fx_connect', 'fx_links', 'fx_extract', 'fx_search'].every((n) => t.includes(n)) && t.split(',').length === 27);
 
   await call('fx_navigate', { url: 'file://' + TEST_HTML });
   await new Promise((r) => setTimeout(r, 700));

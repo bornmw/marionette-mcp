@@ -314,6 +314,29 @@ async function pageInfo() {
   return JSON.parse(r.value);
 }
 
+// Bounded wait until the document reaches readyState 'complete' (used after
+// navigating to external pages, e.g. following a search-result redirect).
+async function waitForComplete(ms = 10000) {
+  const t0 = Date.now();
+  for (;;) {
+    try {
+      const rs = await execJs('return document.readyState;', []);
+      if (rs === 'complete') return;
+    } catch { /* page switching — keep polling */ }
+    if (Date.now() - t0 > ms) return;
+    await new Promise((r) => setTimeout(r, 300));
+  }
+}
+
+// Search-engine presets: DATA, not logic. Selectors are swappable per call
+// (container/title/snippet args) because engines change their DOM (Google's
+// result rows moved from div.g to div.MjjYud) and new engines get added.
+const SEARCH_ENGINES = {
+  google: { url: (q) => 'https://www.google.com/search?q=' + encodeURIComponent(q) + '&hl=en', container: 'div.MjjYud, div.g', title: 'h3', snippet: 'div[data-sncf="1"], div.VwiC3b' },
+  bing: { url: (q) => 'https://www.bing.com/search?q=' + encodeURIComponent(q), container: 'li.b_algo', title: 'h2 > a', snippet: 'div.b_caption > p, .b_lineclamp3, p' },
+  duckduckgo: { url: (q) => 'https://duckduckgo.com/html/?q=' + encodeURIComponent(q), container: 'table.webresult', title: 'h2 > a', snippet: '.result-snippet' },
+};
+
 // ---------------- generic form primitives ----------------
 // Page scripts are plain (non-ES-module) scripts run via WebDriver:ExecuteScript.
 // They must return a JSON-serializable value and receive parameters via arguments[].
@@ -928,6 +951,134 @@ const TOOLS = [
       disabledButtons: (r.disabledButtons || []).map((b) => ({ text: b.text, marker: b.m })),
       banners: r.banners || [],
     };
+  }),
+  T('fx_links', 'Hyperlinks of the current page: text + absolute href (ready to navigate). Generic — any site. Use selector to scope which anchors to list (e.g. a[href^="/url"]); deep=false for light DOM only. For redirect-wrapped destinations (e.g. Google /goto), the in-DOM href is the wrapper — use fx_search {resolve:true} or navigate and fx_page to learn the real URL.', { selector: { type: 'string', description: 'CSS filter on which anchors to list (default: all <a>)' }, deep: { type: 'boolean', description: 'include anchors inside open shadow roots (default true)' }, max: { type: 'number', description: 'max links (default 100)' } }, async (a) => {
+    if (a.selector) await checkCss(a.selector);
+    const r = await execJs(`/*__fxlinks__*/
+  function all(rt, out) { out = out || []; out.push(rt); var els; try { els = rt.querySelectorAll('*'); } catch (e) { return out; } for (var i = 0; i < els.length; i++) { if (els[i].shadowRoot) all(els[i].shadowRoot, out); } return out; }
+  var sel = arguments[0], deep = arguments[1], max = arguments[2];
+  var roots = deep ? all(document) : [document];
+  var seen = {}; var out = [];
+  for (var i = 0; i < roots.length && out.length < max; i++) {
+    var as;
+    try { as = sel ? roots[i].querySelectorAll(sel) : roots[i].querySelectorAll('a'); } catch (e) { continue; }
+    for (var j = 0; j < as.length && out.length < max; j++) {
+      var el = as[j];
+      var href = el.href || el.getAttribute('href') || '';
+      if (!href) continue;
+      var text = (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim().slice(0, 200);
+      var key = el.tagName.toLowerCase() + '|' + href + '|' + text;
+      if (seen[key]) continue;
+      seen[key] = 1;
+      out.push({ i: out.length, text: text, href: href });
+    }
+  }
+  return out;
+  `, [typeof a.selector === 'string' ? a.selector : '', a.deep !== false, a.max != null ? Math.max(1, Number(a.max)) : 100]);
+    if (!Array.isArray(r)) throw new Error('fx_links: unexpected page result ' + typeof r);
+    return { count: r.length, links: r };
+  }),
+  T('fx_extract', 'Structured page read ("scrape" without writing fx_eval JS): one row per container matching the selector. Without fields each row is {i, text} (the container own innerText); with fields {name: "css"|"text"} each row gets one entry per field — the text of the first in-container element matching the field CSS ("text" = the container own innerText). Generic — any site; the selectors are yours (agent-supplied), not hard-coded.', { selector: { type: 'string', description: 'container selector (default body → single row)' }, fields: { type: 'object', description: '{fieldName: cssSelector | "text"}' }, deep: { type: 'boolean', description: 'include containers inside open shadow roots (default true)' }, limit: { type: 'number', description: 'max rows (default 25)' }, textLen: { type: 'number', description: 'max chars per text field (default 300)' } }, async (a) => {
+    if (a.selector) await checkCss(a.selector);
+    const fields = a.fields && typeof a.fields === 'object' && !Array.isArray(a.fields) ? a.fields : null;
+    if (fields) for (const v of Object.values(fields)) if (typeof v !== 'string') throw new Error('fx_extract: field values must be strings (a CSS selector, or "text")');
+    const r = await execJs(`/*__fxextract__*/
+  function all(rt, out) { out = out || []; out.push(rt); var els; try { els = rt.querySelectorAll('*'); } catch (e) { return out; } for (var i = 0; i < els.length; i++) { if (els[i].shadowRoot) all(els[i].shadowRoot, out); } return out; }
+  var sel = arguments[0], fields = arguments[1], deep = arguments[2], limit = arguments[3], textLen = arguments[4];
+  function clean(v) { return String(v == null ? '' : v).replace(/\\s+/g, ' ').trim().slice(0, textLen); }
+  var roots = deep ? all(document) : [document];
+  var out = [];
+  for (var i = 0; i < roots.length; i++) {
+    var cs;
+    try { cs = roots[i].querySelectorAll(sel); } catch (e) { continue; }
+    for (var j = 0; j < cs.length && out.length < limit; j++) {
+      var c = cs[j];
+      var row = { i: out.length };
+      if (!fields) { row.text = clean(c.innerText || c.textContent); }
+      else {
+        for (var k in fields) {
+          var spec = fields[k]; var v;
+          if (spec === 'text') v = c.innerText || c.textContent;
+          else { try { var e2 = c.querySelector(spec); v = e2 ? (e2.innerText || e2.textContent) : ''; } catch (ex) { v = ''; } }
+          row[k] = clean(v);
+        }
+      }
+      out.push(row);
+    }
+  }
+  return out;
+  `, [a.selector || 'body', fields, a.deep !== false, a.limit != null ? Math.max(1, Number(a.limit)) : 25, a.textLen != null ? Math.max(10, Number(a.textLen)) : 300]);
+    if (!Array.isArray(r)) throw new Error('fx_extract: unexpected page result ' + typeof r);
+    return { count: r.length, rows: r };
+  }),
+  T('fx_search', 'Search without writing fx_eval scripts: navigates to the engine results page, waits for the results container, and returns structured rows {title, link, snippet} — the in-DOM href, which for some engines (Google /goto) is a redirect wrapper hiding the real URL. Engine presets: google (default), bing, duckduckgo — their selectors are swappable data: override with container/title/snippet for other engines or when an engine changes its DOM. With resolve:true each result is followed in the real browser (no CORS issue) and reports the genuine final URL + page title; the browser is left on the results page.', { query: { type: 'string' }, engine: { type: 'string', description: 'google | bing | duckduckgo (default google)' }, max: { type: 'number', description: 'max results (default 8, cap 25)' }, resolve: { type: 'boolean', description: 'follow each link and report the real final URL + title (default false)' }, container: { type: 'string', description: 'override results-container selector' }, title: { type: 'string', description: 'override title selector' }, snippet: { type: 'string', description: 'override snippet selector' }, wait_ms: { type: 'number', description: 'how long to wait for the results container (default 10000, max 30000)' } }, async (a) => {
+    const q = String(a.query || '').trim();
+    if (!q) throw new Error('fx_search: query required');
+    const eng = SEARCH_ENGINES[a.engine || 'google'];
+    if (!eng) throw new Error('fx_search: unknown engine "' + (a.engine || 'google') + '" — use google|bing|duckduckgo, or pass container/title/snippet for a custom one');
+    const container = a.container || eng.container;
+    const titleSel = a.title || eng.title;
+    const snippetSel = a.snippet || eng.snippet;
+    if (a.container) await checkCss(a.container);
+    const url = eng.url(q);
+    await M.cmd('WebDriver:Navigate', { url });
+    const waitMs = Math.min(30000, Math.max(500, Number(a.wait_ms) || 10000));
+    const t0 = Date.now();
+    let ready = false;
+    for (;;) {
+      try { ready = !!(await execJs('return !!document.querySelector(arguments[0]);', [container])); } catch { ready = false; }
+      if (ready || Date.now() - t0 > waitMs) break;
+      await new Promise((r) => setTimeout(r, 400));
+    }
+    const n = Math.max(1, Math.min(25, a.max != null ? Number(a.max) : 8));
+    const rows = await execJs(`/*__fxsearch__*/
+  function firstText(el, spec, len) {
+    try {
+      var parts = String(spec).split(',');
+      for (var i = 0; i < parts.length; i++) {
+        var e = el.querySelector(parts[i].trim());
+        if (e) { var t = String(e.innerText || e.textContent || '').replace(/\\s+/g, ' ').trim(); if (t) return t.slice(0, len); }
+      }
+    } catch (x) {}
+    return '';
+  }
+  var sel = arguments[0], title = arguments[1], snip = arguments[2], max = arguments[3];
+  var out = []; var seen = {};
+  var cs;
+  try { cs = document.querySelectorAll(sel); } catch (e) { return out; }
+  for (var i = 0; i < cs.length && out.length < max; i++) {
+    var c = cs[i];
+    var t = firstText(c, title, 200);
+    if (!t) continue;
+    var link = '';
+    try {
+      var as = c.querySelectorAll('a[href]');
+      for (var j = 0; j < as.length; j++) { if (as[j].href) { link = as[j].href; break; } }
+    } catch (x) {}
+    var key = link || t;
+    if (seen[key]) continue;
+    seen[key] = 1;
+    out.push({ i: out.length, title: t, link: link, snippet: firstText(c, snip, 300) });
+  }
+  return out;
+  `, [container, titleSel, snippetSel, n]);
+    if (!Array.isArray(rows)) throw new Error('fx_search: unexpected page result ' + typeof rows);
+    const serp = (await pageInfo()).url;
+    if (a.resolve === true) {
+      for (const r of rows) {
+        if (!r.link) continue;
+        try {
+          await M.cmd('WebDriver:Navigate', { url: r.link });
+          await waitForComplete(15000);
+          const pi = await pageInfo();
+          r.resolvedUrl = pi.url;
+          r.resolvedTitle = pi.title;
+        } catch (e) { r.resolveError = String((e && e.message) || e).slice(0, 200); }
+        await M.cmd('WebDriver:Navigate', { url: serp }).catch(() => {});
+        await new Promise((r) => setTimeout(r, 500));
+      }
+    }
+    return { engine: a.engine || 'google', query: q, url: serp, ready, count: rows.length, results: rows };
   }),
   T('fx_eval', 'Execute JS in the page. `js` is tried as an EXPRESSION first — its completion value is returned, so `1 + 1`, `document.title`, `var x = 1; x`, `(async () => { … })()` and `fetch(u).then(r => r.json())` all work without `return`. If that fails with a SyntaxError (classic function-body style with a top-level `return`), it is re-run as a function body — so `return value` scripts work too. A rejected or Promise value is awaited (default max 30s, wait_ms to tune) and returned as {r: value, awaited: true}; a rejected or long-unsettled Promise is an error.', { js: { type: 'string' }, wait_ms: { type: 'number', description: 'max wait for a Promise-returning body (default 30000, max 120000)' } }, async (a) => {
     const w = await execJs(EVAL_WRAP, [String(a.js)]);

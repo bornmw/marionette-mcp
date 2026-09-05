@@ -133,10 +133,38 @@ function respond(id, name, params, state) {
         const g = state.gates || { boxes: [], disabledButtons: [], banners: [] };
         return [1, id, null, { value: g }];
       }
+      // must precede the generic querySelectorAll branch (these scripts contain that string)
+      if (s.includes('__fxlinks__')) {
+        return [1, id, null, { value: [
+          { i: 0, text: 'Example Domain', href: 'https://example.com/' },
+          { i: 1, text: 'Wrapped destination', href: 'https://www.google.com/goto?url=TOKEN1' },
+        ] }];
+      }
+      if (s.includes('__fxextract__')) {
+        // mirror the real semantics: without fields → {i,text}; with fields {k: "text"|css} → per-field
+        const fields = (params && params.args && params.args[1]) || null;
+        const src = [{ title: 'Row one', text: 'Body text one' }, { title: 'Row two', text: 'Body text two' }];
+        const rows = src.map((row, i) => {
+          const out = { i };
+          if (!fields) out.text = row.text;
+          else for (const k of Object.keys(fields)) out[k] = fields[k] === 'text' ? row.text : (row[k] || '');
+          return out;
+        });
+        return [1, id, null, { value: rows }];
+      }
+      if (s.includes('__fxsearch__')) {
+        return [1, id, null, { value: [
+          { i: 0, title: 'Result one', link: 'https://one.example/a', snippet: 'Snippet one' },
+          { i: 1, title: 'Result two', link: 'https://two.example/b', snippet: 'Snippet two' },
+        ] }];
+      }
+      // NOTE: the pageInfo script also contains "document.readyState", so this
+      // generic branch must come AFTER the JSON.stringify({webdriver} check below.
       if (s.includes('JSON.stringify({webdriver')) {
         const v = JSON.stringify({ webdriver: false, url: 'https://fake.test/', title: 'Fake Page', ready: 'complete' });
         return [1, id, null, { value: v }];
       }
+      if (s.includes('document.readyState')) return [1, id, null, { value: 'complete' }];
       if (s.includes('el.files')) return [1, id, null, { value: 'upload.csv' }];
       if (s.includes('querySelectorAll')) return [1, id, null, { value: SNAPSHOT_ROWS }];
       if (s.includes('innerText.indexOf')) return [1, id, null, { value: true }];

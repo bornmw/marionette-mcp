@@ -81,8 +81,8 @@ test('initialize returns server identity and echoes protocol version', async () 
 test('tools/list exposes the full tool table', async () => {
   const r = await rpc({ jsonrpc: '2.0', id: 2, method: 'tools/list' });
   const names = r.result.tools.map((t) => t.name);
-  assert.equal(names.length, 24, names.join(','));
-  for (const n of ['fx_status', 'fx_connect', 'fx_navigate', 'fx_snapshot', 'fx_click', 'fx_type', 'fx_select', 'fx_toggle', 'fx_upload', 'fx_form', 'fx_field', 'fx_answer', 'fx_scroll', 'fx_gates', 'fx_eval', 'fx_wait', 'fx_screenshot', 'fx_cookies']) {
+  assert.equal(names.length, 27, names.join(','));
+  for (const n of ['fx_status', 'fx_connect', 'fx_navigate', 'fx_snapshot', 'fx_click', 'fx_type', 'fx_select', 'fx_toggle', 'fx_upload', 'fx_form', 'fx_field', 'fx_answer', 'fx_scroll', 'fx_gates', 'fx_links', 'fx_extract', 'fx_search', 'fx_eval', 'fx_wait', 'fx_screenshot', 'fx_cookies']) {
     assert.ok(names.includes(n), 'missing tool ' + n);
   }
   for (const t of r.result.tools) {
@@ -324,6 +324,48 @@ test('notifications produce no response line', async () => {
   assert.equal(lines.length, before);
 });
 
+test('fx_links lists anchors and rejects unsupported CSS', async () => {
+  const r = await rpc({ jsonrpc: '2.0', id: 70, method: 'tools/call', params: { name: 'fx_links', arguments: {} } });
+  const o = JSON.parse(toolText(r));
+  assert.equal(o.count, 2);
+  assert.ok(o.links.every((l) => typeof l.href === 'string' && l.href.startsWith('http')), 'absolute hrefs');
+  const r2 = await rpc({ jsonrpc: '2.0', id: 71, method: 'tools/call', params: { name: 'fx_links', arguments: { selector: ':has(x)' } } });
+  toolErr(r2, /CSS selector rejected/);
+});
+
+test('fx_extract returns structured rows (fields and text mode)', async () => {
+  const r = await rpc({ jsonrpc: '2.0', id: 72, method: 'tools/call', params: { name: 'fx_extract', arguments: { selector: 'div.item', fields: { title: 'h3', blurb: 'text' } } } });
+  const o = JSON.parse(toolText(r));
+  assert.equal(o.count, 2);
+  assert.equal(o.rows[0].title, 'Row one');
+  assert.equal(o.rows[0].blurb, 'Body text one');
+  const r2 = await rpc({ jsonrpc: '2.0', id: 73, method: 'tools/call', params: { name: 'fx_extract', arguments: {} } });
+  const o2 = JSON.parse(toolText(r2));
+  assert.ok(o2.rows.every((row) => typeof row.text === 'string'), 'no-fields mode returns text');
+});
+
+test('fx_search returns structured results; resolve follows links', async () => {
+  const r = await rpc({ jsonrpc: '2.0', id: 74, method: 'tools/call', params: { name: 'fx_search', arguments: { query: 'robotics grants', max: 2 } } });
+  const o = JSON.parse(toolText(r));
+  assert.equal(o.engine, 'google');
+  assert.ok(typeof o.url === 'string' && o.url.startsWith('http'), 'results page url reported');
+  assert.equal(o.count, 2);
+  assert.equal(o.results[0].title, 'Result one');
+  assert.ok(o.results[0].link.startsWith('http'));
+  assert.equal(o.results[0].resolvedUrl, undefined, 'no resolve without resolve:true');
+  const r2 = await rpc({ jsonrpc: '2.0', id: 75, method: 'tools/call', params: { name: 'fx_search', arguments: { query: 'robotics grants', max: 2, resolve: true } } });
+  const o2 = JSON.parse(toolText(r2));
+  assert.equal(o2.results[0].resolvedUrl, 'https://fake.test/', 'resolve reports the final URL after following the redirect');
+  assert.ok(o2.results[0].resolvedTitle, 'resolve reports the final page title');
+});
+
+test('fx_search rejects unknown engine and unsupported container CSS', async () => {
+  const r = await rpc({ jsonrpc: '2.0', id: 76, method: 'tools/call', params: { name: 'fx_search', arguments: { query: 'x', engine: 'yahoo' } } });
+  toolErr(r, /unknown engine/);
+  const r2 = await rpc({ jsonrpc: '2.0', id: 77, method: 'tools/call', params: { name: 'fx_search', arguments: { query: 'x', container: ':has(a)' } } });
+  toolErr(r2, /CSS selector rejected/);
+});
+
 test('fx_connect re-points the MCP at a different endpoint at runtime', async () => {
   const fake2 = await startFakeMarionette();
   try {
@@ -342,6 +384,10 @@ test('fx_connect re-points the MCP at a different endpoint at runtime', async ()
     const r4 = await rpc({ jsonrpc: '2.0', id: 63, method: 'tools/call', params: { name: 'fx_connect', arguments: { port: fake.port } } });
     assert.equal(JSON.parse(toolText(r4)).endpoint.port, fake.port);
   } finally {
+    // If an earlier assertion aborted, the MCP server may still hold a socket to
+    // fake2 (fx_connect re-pointed it) — server.close() would wait on it forever.
+    // Destroy leftovers first (same pattern as the socket-loss test).
+    fake2.closeAll();
     await fake2.stop();
   }
 });

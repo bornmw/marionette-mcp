@@ -18,7 +18,7 @@ Playwright's browser-automation channels (CDP, extension mode) target Chromium, 
  AI agent (e.g. opencode)
         │  stdio · newline-delimited JSON-RPC 2.0
         ▼
-  marionette-mcp (src/server.mjs)          ── tools: fx_* (24)
+  marionette-mcp (src/server.mjs)          ── tools: fx_* (27)
         │  loopback TCP · <byteLen>:<json> frames
         ▼
  your Firefox (firefox --marionette)      ── your profile, your cookies
@@ -116,6 +116,9 @@ Form-tool gotchas (from live ATS/portal forms): re-renders can silently drop che
 | `fx_answer` | Answer a grouped choice question (Yes/No buttons, radio/checkbox options) by question text + option label; re-reads and reports the selection state; runs a toggle cycle on exclusive groups when a stale pre-selection (or ineffective click) is detected; self-heals to clicking the visible text-matching wrapper when option labels are unreadable (`no-option`, e.g. label-less `li` rows) |
 | `fx_scroll` | Scroll an element into view (e.g. under a fixed header), wait, return its top coordinate |
 | `fx_gates` | Consent/attestation gate audit (read-only): visible checkboxes with nearby text — flagging certify/understand/agree/consent/attest/terms/privacy wording — plus disabled buttons (a dead Submit/Apply) and visible alert banners. Run it whenever a submit click does nothing or a submit button stays disabled; the fix is usually an unchecked consent checkbox, not bot protection |
+| `fx_links` | All hyperlinks of the current page: text + absolute href (optional `selector` filter; reads open shadow roots). Generic read — no JS needed |
+| `fx_extract` | Structured page read ("scrape" without JS): one row per container `selector`; per-row `fields {name: css\|"text"}` |
+| `fx_search` | Search without JS: navigate to engine results (google/bing/duckduckgo presets; overridable `container`/`title`/`snippet`), return `{title, link, snippet}` rows; `resolve:true` follows each link in the browser and reports the real final URL/title (needed for redirect-wrapped hrefs, e.g. Google `/goto`) |
 | `fx_eval` | Run JS in the page (function body; `return` your value — a returned Promise is awaited, default 30 s via `wait_ms`) |
 | `fx_wait` | Wait for visible text or CSS selector (≤ 30 s) |
 | `fx_screenshot` | Full-page PNG (not just the viewport) to a file under an allowed root |
