@@ -32,9 +32,10 @@ function resolveElRef(args) {
     const ref = Number(p.ref);
     const entry = snapshotRefs[ref - 1];
     if (!entry) throw new Error('ref ' + ref + ' unknown — run fx_snapshot again');
+    delete p.ref;
+    if (String(entry.k || '').endsWith(':sh')) { p.shadow = entry.x; return p; } // sh:<path> marker
     p.using = p.using || 'xpath';
     p.value = entry.x;
-    delete p.ref;
   }
   if (!p.using || !p.value) {
     if (p.selector) { p.value = p.selector; p.using = p.using || 'css selector'; }
@@ -47,15 +48,18 @@ function resolveElRef(args) {
 async function findEl(using, value) {
   // accepts (using, value) or a single {using, value} ref object
   if (using && typeof using === 'object' && using.using) { value = using.value; using = using.using; }
+  if (using === 'shadow') throw new Error('shadow-root element (sh marker) — the driver cannot target it; use fx_click/fx_type/fx_field/fx_answer, which handle it in-page');
   const r = await M.cmd('WebDriver:FindElement', { using, value });
   return unwrapElementRef(r.value);
 }
 
-// Marker usable inside page scripts: "#id" (css) or "xpath:..."
+// Marker usable inside page scripts: "#id" (css), "xpath:…", or "sh:<path>"
+// (shadow-root element — resolvable in-page only, never by the driver).
 function refMarker(a) {
   if (a.ref != null) {
     const e = snapshotRefs[Number(a.ref) - 1];
     if (!e) throw new Error('ref ' + a.ref + ' unknown — run fx_snapshot again');
+    if (String(e.k || '').endsWith(':sh')) return e.x; // 'sh:<path>'
     return e.css ? e.css : 'xpath:' + e.x;
   }
   if (a.selector) {
@@ -66,7 +70,8 @@ function refMarker(a) {
   throw new Error('need ref (from fx_snapshot) or selector');
 }
 
-const EL0 = `const s=arguments[0]; const el=(s.indexOf('xpath:')===0)?document.evaluate(s.slice(6),document,null,9,null).singleNodeValue:document.querySelector(s);`;
+// Element-resolution snippet shared by the in-page interaction scripts (defined
+// below only once DEEP_UTIL exists, so sh: markers resolve in-page too).
 
 async function execJs(code, args) {
   const r = await M.cmd('WebDriver:ExecuteScript', { script: code, args: args || [] });
@@ -133,8 +138,90 @@ function allowedPath(abs) {
   return FILE_ROOTS.some((r0) => abs === r0 || abs.startsWith(r0 + path.sep));
 }
 
-const SNAPSHOT_JS = `
-return (function () {
+// ---------------- shadow-DOM (deep) support ----------------
+// Elements inside OPEN shadow roots are invisible to document.querySelector and
+// to driver FindElement (css/xpath never cross a shadow boundary). They get an
+// "sh:<path>" marker: a tag[idx] chain from <html> that hops through each
+// shadowRoot -> host boundary; __deepResolve walks the same segments back.
+// Closed shadow roots (el.shadowRoot === null) are unreachable by ANY means and
+// are never enumerated. The driver cannot click/type inside shadow, so shadow
+// markers are interacted with in-page via the full pointer/mouse event sequence
+// (synthetic events — the proven path for hue-web-style web components).
+const DEEP_UTIL = `
+function __xp(el){ if(!el||el.nodeType!==1) return ''; var p=[]; var n=el; while(n&&n.nodeType===1){ var t=n.tagName.toLowerCase(); var s=n.parentElement?Array.prototype.filter.call(n.parentElement.children,c=>c.tagName===n.tagName):[n]; p.unshift(t+'['+(s.indexOf(n)+1)+']'); n=n.parentElement;} return '/'+p.join('/'); }
+function __deepMark(el){
+  var steps=[],n=el,g=0,inShadow=false;
+  while(n&&g++<64){
+    var par=n.parentElement;
+    if(par){
+      var sibs=Array.prototype.filter.call(par.children,function(c){return c.tagName===n.tagName;});
+      steps.unshift(n.tagName.toLowerCase()+'['+(sibs.indexOf(n)+1)+']');
+      n=par;continue;
+    }
+    var rn=n.getRootNode?n.getRootNode():n;
+    if(rn&&rn.nodeType===11){
+      inShadow=true;
+      var host=rn.host;if(!host)break;
+      var hp=host.parentElement;if(!hp)break;
+      var hs=Array.prototype.filter.call(hp.children,function(c){return c.tagName===host.tagName;});
+      steps.unshift(host.tagName.toLowerCase()+'['+(hs.indexOf(host)+1)+']');
+      n=hp;continue;
+    }
+    break;
+  }
+  if(!inShadow||!steps.length)return null;
+  if(steps[0].slice(0,4)!=='html')steps.unshift('html[1]');
+  return 'sh:'+steps.join('/');
+}
+// Resolve an "sh:<path>" marker: a light-child walk cannot reconstruct shadow
+// segments (segments are tag+idx relative to EACH element's own parent, and the
+// light/shadow ancestor chains stitch at host boundaries at different depths),
+// so instead we collect every light+shadow element and return the one whose
+// own __deepMark signature equals p (exact, collision-free for a live tree).
+function __deepResolve(p){
+  if(typeof p!=='string'||p.indexOf('sh:')!==0)return null;
+  var all=[];
+  (function collect(root,depth){
+    if(!root||depth>12)return;
+    var els;try{els=root.querySelectorAll('*');}catch(e){return;}
+    for(var i=0;i<els.length;i++){
+      all.push(els[i]);
+      if(els[i].shadowRoot)collect(els[i].shadowRoot,depth+1);
+    }
+  })(document,0);
+  for(var k=0;k<all.length;k++){
+    if(__deepMark(all[k])===p)return all[k];
+  }
+  return null;
+}
+// Collect elements matching sel inside the OPEN shadow roots of root (recursing
+// into nested shadow trees); light-DOM matches are NOT included.
+function __deepShadowQ(root,sel,out,depth){
+  out=out||[];depth=depth||0;
+  if(!root||depth>12)return out;
+  var all;try{all=root.querySelectorAll('*');}catch(e){return out;}
+  for(var i=0;i<all.length;i++){
+    var sr=all[i].shadowRoot;
+    if(!sr)continue;
+    var m;try{m=sr.querySelectorAll(sel);}catch(e){continue;}
+    for(var j=0;j<m.length;j++)out.push(m[j]);
+    __deepShadowQ(sr,sel,out,depth+1);
+  }
+  return out;
+}
+function __allMatch(root,sel){
+  var out=[];
+  var light;try{light=root.querySelectorAll(sel);for(var i=0;i<light.length;i++)out.push(light[i]);}catch(e){}
+  __deepShadowQ(root,sel,out,0);
+  return out;
+}
+`;
+
+// Resolves a marker in-page: sh:<path> (shadow root) | xpath:… | css selector.
+const EL0 = DEEP_UTIL + `const s=arguments[0]; const el=(s.indexOf('sh:')===0)?__deepResolve(s):((s.indexOf('xpath:')===0)?document.evaluate(s.slice(6),document,null,9,null).singleNodeValue:document.querySelector(s));`;
+
+const SNAPSHOT_JS = DEEP_UTIL + `
+return (function (deep) {
   function xp(el) {
     if (!el || el.nodeType !== 1) return '';
     const parts = [];
@@ -159,22 +246,23 @@ return (function () {
     if (out.length >= 140) return;
   });
   const sel = 'a[href],button,input,select,textarea,[role=button],[role=link],[role=tab],[role=checkbox],[role=radio],[role=combobox],[role=switch],[role=option],[role=menuitem],[onclick],[tabindex]';
-  document.querySelectorAll(sel).forEach((el) => {
-    if (!vis(el) || (el.offsetParent === null && el.getClientRects().length === 0)) return;
-    const x = xp(el);
+  const addRow = (el, sh) => {
+    const v = sh ? (el.getBoundingClientRect().width > 0 && el.getBoundingClientRect().height > 0 && el.getClientRects().length > 0 && el.type !== 'hidden') : vis(el);
+    if (!v || (el.offsetParent === null && !sh && el.getClientRects().length === 0)) return;
+    const x = sh ? __deepMark(el) : xp(el);
+    if (!x) return;
     if (seen.has(x)) return;
     seen.add(x);
     const kind = el.tagName.toLowerCase() + (el.type ? ':' + el.type : '');
     let txt = el.innerText || el.getAttribute('aria-label') || el.placeholder || '';
     txt = (txt || '').trim().replace(/\\s+/g, ' ').slice(0, 70);
-    const css = el.id && document.querySelector('#' + CSS.escape(el.id)) === el ? '#' + CSS.escape(el.id) : '';
+    const css = sh ? '' : (el.id && document.querySelector('#' + CSS.escape(el.id)) === el ? '#' + CSS.escape(el.id) : '');
     let lbl = '';
-    var lEl = el.id ? document.querySelector('label[for="' + CSS.escape(el.id) + '"]') : null;
-    if (lEl && (lEl.textContent || '').trim()) lbl = (lEl.textContent || '').trim().replace(/\\s+/g, ' ').slice(0, 90);
+    if (!sh && el.id) { var lEl0 = document.querySelector('label[for="' + CSS.escape(el.id) + '"]'); if (lEl0 && (lEl0.textContent || '').trim()) lbl = (lEl0.textContent || '').trim().replace(/\\s+/g, ' ').slice(0, 90); }
     if (!lbl && el.closest) { var wL = el.closest('label'); if (wL) { var wt = (wL.textContent || '').trim(); if (wt) lbl = wt.replace(/\\s+/g, ' ').slice(0, 90); } }
     out.push({
-      i: i++, k: kind, x, t: txt, css,
-      id: el.id || '',
+      i: i++, k: kind + (sh ? ':sh' : ''), x, t: txt, css,
+      id: sh ? '' : (el.id || ''),
       l: lbl,
       ph: el.placeholder || '',
       al: el.getAttribute('aria-label') || '',
@@ -182,10 +270,17 @@ return (function () {
       sel: el.checked === true ? '*' : '',
       dis: el.disabled ? '!' : ''
     });
+  };
+  document.querySelectorAll(sel).forEach((el) => {
+    addRow(el, false);
     if (out.length >= 140) return;
   });
+  if (deep) __deepShadowQ(document, sel, null, 0).forEach((el) => {
+    if (out.length >= 140) return;
+    addRow(el, true);
+  });
   return out;
-})()
+})(!!arguments[0])
 `;
 
 function fmtSnapshot(rows) {
@@ -197,6 +292,7 @@ function fmtSnapshot(rows) {
     if (r.k === 'h') { lines.push('#' + r.t); continue; }
     n++;
     const bits = [r.k];
+    if (String(r.k || '').endsWith(':sh')) bits.push('SHADOW');
     if (r.id) bits.push('#' + r.id);
     if (r.l) bits.push('lbl=' + JSON.stringify(r.l));
     if (r.al) bits.push('aria=' + JSON.stringify(r.al));
@@ -223,27 +319,96 @@ async function pageInfo() {
 // They must return a JSON-serializable value and receive parameters via arguments[].
 const XP_JS = `function __xp(el){ if(!el||el.nodeType!==1) return ''; const p=[]; let n=el; while(n&&n.nodeType===1){ const t=n.tagName.toLowerCase(); const s=n.parentElement?Array.prototype.filter.call(n.parentElement.children,c=>c.tagName===n.tagName):[n]; p.unshift(t+'['+(s.indexOf(n)+1)+']'); n=n.parentElement;} return '/'+p.join('/'); }`;
 
-// Enumerate visible form fields. args: [max, onlyIndex, id, labelQuery(lowercase), rootSelector]
-// Returns: array of {i,tag,type,id,name,label,ph,ctx,dis,req,val?,on?,files?,options?,m(marker)}
-const FIELD_JS = XP_JS + `
+
+
+const DEEP_CLICK_JS = DEEP_UTIL + `
+return (function(m){
+  var el=__deepResolve(arguments[0]);
+  if(!el)return 'sh-gone';
+  try{el.scrollIntoView({block:'center',behavior:'instant'});}catch(e){}
+  var r=el.getBoundingClientRect();
+  var p={bubbles:true,cancelable:true,view:window,clientX:r.left+r.width/2,clientY:r.top+r.height/2,button:0};
+  el.dispatchEvent(new MouseEvent('pointerdown',p));
+  el.dispatchEvent(new MouseEvent('mousedown',p));
+  el.dispatchEvent(new MouseEvent('pointerup',p));
+  el.dispatchEvent(new MouseEvent('mouseup',p));
+  el.dispatchEvent(new MouseEvent('click',p));
+  return 'ok';
+})(arguments[0]);
+`;
+
+// Deep type into a shadow-root control: text/textarea = native value setter +
+// input/change events; checkbox/radio = full pointer click (toggles); select =
+// option match (value or label) + change event. Returns the resulting value.
+const DEEP_TYPE_JS = DEEP_UTIL + `
+return (function(m,txt,keep){
+  var el=__deepResolve(arguments[0]);
+  if(!el)return 'sh-gone';
+  try{el.scrollIntoView({block:'center',behavior:'instant'});}catch(e){}
+  if(el.focus)el.focus();
+  if(el.type==='checkbox'||el.type==='radio'){
+    var r=el.getBoundingClientRect();
+    var p={bubbles:true,cancelable:true,view:window,clientX:r.left+r.width/2,clientY:r.top+r.height/2,button:0};
+    el.dispatchEvent(new MouseEvent('pointerdown',p));
+    el.dispatchEvent(new MouseEvent('mousedown',p));
+    el.dispatchEvent(new MouseEvent('pointerup',p));
+    el.dispatchEvent(new MouseEvent('mouseup',p));
+    el.dispatchEvent(new MouseEvent('click',p));
+    return el.checked?'on':'off';
+  }
+  if(el.tagName==='SELECT'){
+    var opts=el.options,i;
+    for(i=0;i<opts.length;i++){if(opts[i].value===txt)break;if((opts[i].textContent||'').trim()===txt)break;}
+    if(i>=opts.length)return 'no-option:'+txt;
+    el.selectedIndex=i;
+    el.dispatchEvent(new Event('change',{bubbles:true}));
+    return String(el.value);
+  }
+  var proto=el.tagName==='TEXTAREA'?HTMLTextAreaElement:HTMLInputElement;
+  var d=Object.getOwnPropertyDescriptor(proto.prototype,'value');
+  if(keep&&d&&d.set)d.set.call(el,el.value+txt);
+  else if(d&&d.set){d.set.call(el,''); if(txt)d.set.call(el,txt);}
+  else{el.value=keep?(el.value+txt):txt;}
+  el.dispatchEvent(new Event('input',{bubbles:true}));
+  el.dispatchEvent(new Event('change',{bubbles:true}));
+  return String(el.value);
+})(arguments[0],arguments[1],arguments[2]);
+`;
+
+const DEEP_SCROLL_JS = DEEP_UTIL + `
+return (function(m){
+  var el=__deepResolve(arguments[0]);
+  if(!el)return 'sh-gone';
+  el.scrollIntoView({block:'center',behavior:'instant'});
+  return 'ok:'+Math.round(el.getBoundingClientRect().top);
+})(arguments[0]);
+`;
+
+// Enumerate visible form fields (light + open shadow roots when deep).
+// args: [max, onlyIndex, id, labelQuery(lowercase), rootSelector, deep]
+// Returns: array of {i,tag,type,id,name,label,ph,ctx,dis,req,sh?,val?,on?,files?,options?,m(marker)}
+const FIELD_JS = DEEP_UTIL + `
 return (function(){
-  var max=Number(arguments[0])||80, only=Number(arguments[1])||0, id=arguments[2]||'', lq=(arguments[3]||'').toLowerCase(), rc=arguments[4]||'';
+  var max=Number(arguments[0])||80, only=Number(arguments[1])||0, id=arguments[2]||'', lq=(arguments[3]||'').toLowerCase(), rc=arguments[4]||'', deep=!!arguments[5];
   function norm(s){ return (s==null?'':String(s)).trim().replace(/\\s+/g,' '); }
   function vis(el){ var r=el.getBoundingClientRect(); return r.width>0 && r.height>0 && el.type!=='hidden' && (el.offsetParent!==null || el.getClientRects().length>0); }
-  function labelOf(el){ if(el.id){ var l=document.querySelector('label[for="'+CSS.escape(el.id)+'"]'); if(l && norm(l.textContent)) return norm(l.textContent).slice(0,120); } var wl=el.closest?el.closest('label'):null; if(wl){ var wt=norm(wl.textContent); if(wt) return wt.slice(0,120); } var al=el.getAttribute('aria-label'); if(al && norm(al)) return norm(al).slice(0,120); if(el.type==='radio'||el.type==='checkbox'){ var w=el.parentElement, g=0; while(w && g<6){ var n=w.querySelectorAll?w.querySelectorAll('input[type=radio],input[type=checkbox]').length:99; var t=norm(w.textContent); if(n===1 && t.length>=2 && t.length<=160) return t.slice(0,120); w=w.parentElement; g++; } } return ''; }
+  function labelOf(el){ var rt=el.getRootNode?el.getRootNode():document; if(el.id&&rt.querySelectorAll){ var ll=rt.querySelectorAll('label[for="'+CSS.escape(el.id)+'"]')[0]; if(ll && norm(ll.textContent)) return norm(ll.textContent).slice(0,120); } var wl=el.closest?el.closest('label'):null; if(wl){ var wt=norm(wl.textContent); if(wt) return wt.slice(0,120); } var al=el.getAttribute('aria-label'); if(al && norm(al)) return norm(al).slice(0,120); if(el.type==='radio'||el.type==='checkbox'){ var w=el.parentElement, g=0; while(w && g<6){ var n=w.querySelectorAll?w.querySelectorAll('input[type=radio],input[type=checkbox]').length:99; var t=norm(w.textContent); if(n===1 && t.length>=2 && t.length<=160) return t.slice(0,120); w=w.parentElement; g++; } } return ''; }
   function ctxOf(el){ var t=el.parentElement, g=0; while(t && g<7){ var c=norm(t.textContent); if(c.length>=15 && c.length<=600) return c.slice(0,160); t=t.parentElement; g++; } return ''; }
-  function markerOf(el){ if(el.id){ var m='#'+CSS.escape(el.id); try{ if(document.querySelector(m)===el) return m; }catch(e){} } return 'xpath:'+__xp(el); }
-    var scope = rc ? (document.querySelector(rc) || document) : document;
+  function markerOf(el){ var dm=__deepMark(el); if(dm) return dm; if(el.id){ var m='#'+CSS.escape(el.id); try{ if(document.querySelector(m)===el) return m; }catch(e){} } return 'xpath:'+__xp(el); }
+  var scope = rc ? (document.querySelector(rc) || document) : document;
   var fields=[];
-  scope.querySelectorAll('input,textarea,select').forEach(function(el){
+  function addF(el, sh){
+    if(!el) return;
     if(!vis(el)) return;
-    var f={ i: fields.length+1, tag: el.tagName.toLowerCase(), type: el.type||'', id: el.id||'', name: el.name||'', label: labelOf(el), ph: el.placeholder||'', ctx: ctxOf(el), dis: el.disabled?1:0, req: el.required?1:0, m: markerOf(el) };
+    var f={ i: fields.length+1, tag: el.tagName.toLowerCase(), type: el.type||'', id: el.id||'', name: el.name||'', label: labelOf(el), ph: el.placeholder||'', ctx: ctxOf(el), dis: el.disabled?1:0, req: el.required?1:0, m: markerOf(el), sh: sh?1:0 };
     if(el.type==='file'){ f.files = Array.prototype.slice.call(el.files||[]).map(function(x){ return x.name; }); }
     else if(el.tagName==='SELECT'){ f.val = String(el.value); f.options = Array.prototype.slice.call(el.options).slice(0,20).map(function(o){ return { v: o.value, t: norm(o.textContent).slice(0,60), s: o.selected?1:0 }; }); }
     else { f.val = el.type==='password' ? '-pw-' : String(el.value==null?'':el.value).slice(0,120); }
     if(el.type==='checkbox' || el.type==='radio'){ f.on = el.checked?1:0; }
     fields.push(f);
-  });
+  }
+  scope.querySelectorAll('input,textarea,select').forEach(function(el){ addF(el, false); });
+  if(deep) __deepShadowQ(document,'input,textarea,select',null,0).forEach(function(el){ addF(el, true); });
   var cap = fields.slice(0,max);
   var groups=[]; var gmap={};
   cap.forEach(function(f){
@@ -258,23 +423,24 @@ return (function(){
   if(lq){ var m2=[]; for(var j=0;j<fields.length;j++){ if(norm(fields[j].label).toLowerCase().indexOf(lq)>=0) m2.push(fields[j]); } return m2.slice(0,10); }
   if(only){ var m3=[]; for(var k=0;k<fields.length;k++){ if(fields[k].i===only) m3.push(fields[k]); } return m3; }
   return { f: cap, g: groups };
-})(arguments[0], arguments[1], arguments[2], arguments[3], arguments[4]);
+})(arguments[0], arguments[1], arguments[2], arguments[3], arguments[4], arguments[5]);
 `;
 
 // Locate one choice group by question text and pick an option. args: [question, choice, exact]
+// Works across light + open shadow DOM (shadow controls get sh: markers).
 // Returns: {ctx, option, kind, marker, labelMarker, state, options[]} or {error, ...}
-const ANSWER_FIND_JS = XP_JS + `/*__answerfind__*/
+const ANSWER_FIND_JS = DEEP_UTIL + `/*__answerfind__*/
 return (function(){
   var Q=(arguments[0]||'').toLowerCase(), C=arguments[1]||'', exact=!!arguments[2];
   function norm(s){ return (s==null?'':String(s)).trim().replace(/\\s+/g,' '); }
-  function vis(el){ var r=el.getBoundingClientRect(); return r.width>0 && r.height>0 && el.offsetParent!==null; }
+  function vis(el){ var r=el.getBoundingClientRect(); return r.width>0 && r.height>0 && el.type!=='hidden' && (el.offsetParent!==null || el.getClientRects().length>0); }
   function ctxOf(el){ var t=el.parentElement, g=0; while(t && g<8){ var c=norm(t.textContent); if(c.length>=15 && c.length<=800) return c.slice(0,240); t=t.parentElement; g++; } return ''; }
-  function labelOf(el){ if(el.id){ var l=document.querySelector('label[for="'+CSS.escape(el.id)+'"]'); if(l && norm(l.textContent)) return norm(l.textContent); } var wl = el.closest ? el.closest('label') : null; if(wl){ var wt = norm(wl.textContent); if(wt) return wt; } var al=el.getAttribute('aria-label'); if(al) return norm(al); if(el.tagName==='BUTTON') return norm(el.textContent); if(el.type==='radio'||el.type==='checkbox'){ var w=el.parentElement, g=0; while(w && g<6){ var n=w.querySelectorAll?w.querySelectorAll('input[type=radio],input[type=checkbox]').length:99; var t=norm(w.textContent); if(n===1 && t.length>=2 && t.length<=160) return t; w=w.parentElement; g++; } } return ''; }
-  function markerOf(el){ if(el.id){ var m='#'+CSS.escape(el.id); try{ if(document.querySelector(m)===el) return m; }catch(e){} } return 'xpath:'+__xp(el); }
+  function labelOf(el){ var rt=el.getRootNode?el.getRootNode():document; if(el.id&&rt.querySelectorAll){ var l=rt.querySelectorAll('label[for="'+CSS.escape(el.id)+'"]')[0]; if(l && norm(l.textContent)) return norm(l.textContent); } var wl = el.closest ? el.closest('label') : null; if(wl){ var wt = norm(wl.textContent); if(wt) return wt; } var al=el.getAttribute('aria-label'); if(al) return norm(al); if(el.tagName==='BUTTON') return norm(el.textContent); if(el.type==='radio'||el.type==='checkbox'){ var w=el.parentElement, g=0; while(w && g<6){ var n=w.querySelectorAll?w.querySelectorAll('input[type=radio],input[type=checkbox]').length:99; var t=norm(w.textContent); if(n===1 && t.length>=2 && t.length<=160) return t; w=w.parentElement; g++; } } return ''; }
+  function markerOf(el){ var dm=__deepMark(el); if(dm) return dm; if(el.id){ var m='#'+CSS.escape(el.id); try{ if(document.querySelector(m)===el) return m; }catch(e){} } return 'xpath:'+__xp(el); }
   function selState(el){ if(el.type==='checkbox'||el.type==='radio') return el.checked?'on':'off'; var ap=el.getAttribute('aria-pressed'); if(ap!=null) return ap==='true'?'on':'off'; return 'unknown'; }
   var cands=[];
-  document.querySelectorAll('input[type=radio],input[type=checkbox]').forEach(function(el){ if(!vis(el)) return; cands.push({ el: el, kind: 'input', label: labelOf(el), ctx: ctxOf(el) }); });
-  document.querySelectorAll('button,[role=radio],[role=switch]').forEach(function(el){ var t=norm(el.textContent); if(!t||t.length>14) return; if(!vis(el)) return; cands.push({ el: el, kind: el.tagName==='BUTTON'?'button':'role', label: t, ctx: ctxOf(el) }); });
+  __allMatch(document,'input[type=radio],input[type=checkbox]').forEach(function(el){ if(!vis(el)) return; cands.push({ el: el, kind: 'input', label: labelOf(el), ctx: ctxOf(el) }); });
+  __allMatch(document,'button,[role=radio],[role=switch]').forEach(function(el){ var t=norm(el.textContent); if(!t||t.length>14) return; if(!vis(el)) return; cands.push({ el: el, kind: el.tagName==='BUTTON'?'button':'role', label: t, ctx: ctxOf(el) }); });
   if(!cands.length) return { error: 'no-choice-controls' };
   var groups = new Map();
   cands.forEach(function(c){ var key = c.ctx || '__noctx__'; if(!groups.has(key)) groups.set(key, []); groups.get(key).push(c); });
@@ -289,7 +455,7 @@ return (function(){
   if(picks.length>1) return { error: 'ambiguous-option', options: picks.map(function(c){ return c.label; }), ctx: matched[0][0].slice(0,200) };
   var p=picks[0];
   var labelMarker=null;
-  if(p.kind==='input'){ var l2=p.el.id?document.querySelector('label[for="'+CSS.escape(p.el.id)+'"]'):null; if(l2 && vis(l2)) labelMarker=markerOf(l2); }
+  if(p.kind==='input'){ var rt2=p.el.getRootNode?p.el.getRootNode():document; var l2=p.el.id&&rt2.querySelectorAll?rt2.querySelectorAll('label[for="'+CSS.escape(p.el.id)+'"]')[0]:null; if(l2 && vis(l2)) labelMarker=markerOf(l2); }
   var single = arr.every(function(c){ return (c.kind==='button'||c.kind==='role') || (c.el && c.el.type==='radio'); });
   var alts = arr.filter(function(c){ return c.label!==p.label; }).slice(0,2).map(function(c){ return { label: c.label, kind: c.kind, marker: markerOf(c.el), state: selState(c.el) }; });
   return { ctx: matched[0][0].slice(0,240), option: p.label, kind: p.kind, marker: markerOf(p.el), labelMarker: labelMarker || null, state: selState(p.el), single: single, alts: alts, options: arr.map(function(c){ return c.label; }).slice(0,12) };
@@ -301,16 +467,16 @@ return (function(){
 // with no label association): find a VISIBLE wrapper (li/label/[role=option]/
 // button) whose text matches the choice, scoped to the question's context, and
 // return its marker so the caller can issue a real click on the wrapper.
-const ANSWER_FALLBACK_JS = XP_JS + `/*__answerfallback__*/
+const ANSWER_FALLBACK_JS = DEEP_UTIL + `/*__answerfallback__*/
 return (function(){
   var Q=(arguments[0]||'').toLowerCase(), C=(arguments[1]||'').trim();
   function norm(s){ return (s==null?'':String(s)).trim().replace(/\\s+/g,' '); }
   function vis(el){ var r=el.getBoundingClientRect(); return r.width>0 && r.height>0 && (el.offsetParent!==null || el.getClientRects().length>0); }
   function ctxOf(el){ var t=el.parentElement, g=0; while(t && g<8){ var c=norm(t.textContent); if(c.length>=15 && c.length<=800) return c.slice(0,240); t=t.parentElement; g++; } return ''; }
-  function markerOf(el){ if(el.id){ var m='#'+CSS.escape(el.id); try{ if(document.querySelector(m)===el) return m; }catch(e){} } return 'xpath:'+__xp(el); }
+  function markerOf(el){ var dm=__deepMark(el); if(dm) return dm; if(el.id){ var m='#'+CSS.escape(el.id); try{ if(document.querySelector(m)===el) return m; }catch(e){} } return 'xpath:'+__xp(el); }
   var cl=C.toLowerCase();
   var cands=[];
-  document.querySelectorAll('li,label,[role=option],button').forEach(function(w){
+  __allMatch(document,'li,label,[role=option],button').forEach(function(w){
     if(!vis(w)) return;
     var t=norm(w.textContent);
     if(t.length<2 || t.length>160) return;
@@ -332,9 +498,9 @@ return (function(){
 `;
 
 // Re-read the selection state of a (fallback) wrapper after clicking it.
-const ANSWER_REREAD_JS = `/*__answerreread__*/
+const ANSWER_REREAD_JS = DEEP_UTIL + `/*__answerreread__*/
 return (function(m){
-  var el = (m && m.indexOf('xpath:')===0) ? document.evaluate(m.slice(6),document,null,9,null).singleNodeValue : document.querySelector(m);
+  var el = (m && m.indexOf('sh:')===0) ? __deepResolve(m) : (m && m.indexOf('xpath:')===0) ? document.evaluate(m.slice(6),document,null,9,null).singleNodeValue : document.querySelector(m);
   if(!el) return 'gone';
   var inp = el.tagName==='BUTTON' ? el : el.querySelector('input[type=radio],input[type=checkbox]');
   if(inp && (inp.type==='radio' || inp.type==='checkbox')) return inp.checked ? 'on' : 'off';
@@ -348,34 +514,35 @@ return (function(m){
 // nearby text, consent-pattern flags (certify/understand/agree/consent/attest/
 // terms/privacy/acknowledge), disabled buttons (dead Submit/Apply), and visible
 // alert-style banners. Read-only; built for the "submit click does nothing" case.
-const GATES_JS = XP_JS + `/*__gates__*/
+const GATES_JS = DEEP_UTIL + `/*__gates__*/
 return (function(){
   function norm(s){ return (s==null?'':String(s)).trim().replace(/\\s+/g,' '); }
-  function vis(el){ var r=el.getBoundingClientRect(); return r.width>0 && r.height>0 && (el.offsetParent!==null || el.getClientRects().length>0); }
-  function markerOf(el){ if(el.id){ var m='#'+CSS.escape(el.id); try{ if(document.querySelector(m)===el) return m; }catch(e){} } return 'xpath:'+__xp(el); }
+  function vis(el){ var r=el.getBoundingClientRect(); return r.width>0 && r.height>0 && el.type!=='hidden' && (el.offsetParent!==null || el.getClientRects().length>0); }
+  function markerOf(el){ var dm=__deepMark(el); if(dm) return dm; if(el.id){ var m='#'+CSS.escape(el.id); try{ if(document.querySelector(m)===el) return m; }catch(e){} } return 'xpath:'+__xp(el); }
   var GATE=/certif|understand|agree|consent|attest|terms|privacy|acknowledge/i;
   function textOf(el){
     var lbl='';
-    if(el.id){ var l=document.querySelector('label[for="'+CSS.escape(el.id)+'"]'); if(l && norm(l.textContent)) lbl=norm(l.textContent); }
+    var rt=el.getRootNode?el.getRootNode():document;
+    if(el.id&&rt.querySelectorAll){ var l=rt.querySelectorAll('label[for="'+CSS.escape(el.id)+'"]')[0]; if(l && norm(l.textContent)) lbl=norm(l.textContent); }
     if(!lbl){ var wl=el.closest?el.closest('label'):null; if(wl && norm(wl.textContent)) lbl=norm(wl.textContent); }
     if(!lbl){ var w=el.parentElement, g=0; while(w && g<5){ var n=w.querySelectorAll('input[type=checkbox]').length; var t=norm(w.textContent); if(n<=1 && t.length>=2 && t.length<=240) { lbl=t; break; } w=w.parentElement; g++; } }
     if(!lbl){ var al=el.getAttribute('aria-label'); if(al) lbl=norm(al); }
     return lbl;
   }
   var boxes=[];
-  document.querySelectorAll('input[type=checkbox]').forEach(function(el){
+  __allMatch(document,'input[type=checkbox]').forEach(function(el){
     if(!vis(el)) return;
     var t=textOf(el);
     boxes.push({ i: boxes.length+1, checked: el.checked===true, req: el.required?1:0, gate: GATE.test(t)?1:0, text: t.slice(0,200), m: markerOf(el) });
   });
-  document.querySelectorAll('[role=checkbox]').forEach(function(el){
+  __allMatch(document,'[role=checkbox]').forEach(function(el){
     if(!vis(el)) return;
     var t=norm(el.textContent);
     boxes.push({ i: boxes.length+1, checked: el.getAttribute('aria-checked')==='true', req: 0, gate: GATE.test(t)?1:0, text: t.slice(0,200), m: markerOf(el), role: 1 });
   });
   if(boxes.length>25) boxes=boxes.slice(0,25);
   var dis=[];
-  document.querySelectorAll('button,[role=button]').forEach(function(el){
+  __allMatch(document,'button,[role=button]').forEach(function(el){
     if(!vis(el)) return;
     if(!(el.disabled===true || el.getAttribute('aria-disabled')==='true')) return;
     var t=norm(el.textContent);
@@ -406,6 +573,11 @@ function markerRef(marker) {
 // chrome — hit-test the obscuring topmost in-page; when it belongs to the same
 // widget, click that instead. Non-obscuring errors rethrow unchanged.
 async function clickVia(marker) {
+  if (typeof marker === 'string' && marker.startsWith('sh:')) {
+    const r = await execJs(DEEP_CLICK_JS, [marker]);
+    if (String(r) === 'sh-gone') throw new Error('shadow element vanished before click — re-run fx_snapshot');
+    return { el: 'shadow', mode: 'shadow' };
+  }
   const el = await findEl(markerRef(marker));
   try {
     await M.cmd('WebDriver:ElementClick', { id: el });
@@ -447,11 +619,16 @@ const TOOLS = [
     const pi = await pageInfo();
     return { url: pi.url, title: pi.title };
   }),
-  T('fx_snapshot', 'Interactive-element map with refs (use refs in fx_click/fx_type/...)', {}, async () => {
-    return fmtSnapshot(await execJs(SNAPSHOT_JS));
+  T('fx_snapshot', 'Interactive-element map with refs (use refs in fx_click/fx_type/...). Crosses OPEN shadow roots by default: web-component modals/dialogs (e.g. LinkedIn post-apply prompts) get their own refs, marked "SHADOW"; clicking a shadow ref fires a full pointer/mouse sequence in-page (the driver cannot target shadow elements). deep=false → light DOM only. Closed shadow roots are never visible to any tool.', { deep: { type: 'boolean', description: 'include controls inside open shadow roots (default true)' } }, async (a) => {
+    return fmtSnapshot(await execJs(SNAPSHOT_JS, [a.deep !== false]));
   }),
-  T('fx_click', 'Click element by ref (from fx_snapshot) or CSS selector. Digit-leading ids: use [id="…"] form (a bare #1abc is not valid CSS) — or pass it as-is and the tool will rewrite it for you. Unsupported CSS (e.g. :has()) is caught in-page with an actionable error before the driver call. If the element is obscured by an overlay of its own widget (Material button chrome, an li/label over a hidden input), the obscuring topmost element is clicked instead and reported as used:"overlay-top:…".', { ref: { type: 'number' }, selector: { type: 'string' } }, async (a) => {
+  T('fx_click', 'Click element by ref (from fx_snapshot) or CSS selector. Digit-leading ids: use [id="…"] form (a bare #1abc is not valid CSS) — or pass it as-is and the tool will rewrite it for you. Unsupported CSS (e.g. :has()) is caught in-page with an actionable error before the driver call. If the element is obscured by an overlay of its own widget (Material button chrome, an li/label over a hidden input), the obscuring topmost element is clicked instead and reported as used:"overlay-top:…". Shadow-ref elements (marked SHADOW in fx_snapshot) are clicked in-page via the full pointer/mouse event sequence and reported via:"shadow".', { ref: { type: 'number' }, selector: { type: 'string' } }, async (a) => {
     const p = resolveElRef(a);
+    if (p.shadow) {
+      const r = await execJs(DEEP_CLICK_JS, [p.shadow]);
+      if (String(r) === 'sh-gone') throw new Error('shadow element vanished before click — re-run fx_snapshot');
+      return { ok: true, via: 'shadow' };
+    }
     if (p.using === 'css selector') { p.value = hardenCss(p.value); await checkCss(p.value); }
     await findEl(p.using, p.value); // resolve early: actionable error for bad selectors
     const c = await clickVia(refMarker(a));
@@ -460,41 +637,49 @@ const TOOLS = [
     if (c.mode !== 'direct') out.via = 'overlay-top:' + c.mode;
     return out;
   }),
-  T('fx_type', 'Type text into element (clears first unless keep=true). Same selector rules as fx_click (digit-leading #ids auto-rewritten to [id="…"]; unsupported CSS caught in-page).', { ref: { type: 'number' }, selector: { type: 'string' }, text: { type: 'string' }, keep: { type: 'boolean', description: 'true = append instead of clearing' } }, async (a) => {
+  T('fx_type', 'Type text into element (clears first unless keep=true). Same selector rules as fx_click (digit-leading #ids auto-rewritten to [id="…"]; unsupported CSS caught in-page). Shadow-ref elements get the value set in-page (native value setter + input/change events) and report via:"shadow".', { ref: { type: 'number' }, selector: { type: 'string' }, text: { type: 'string' }, keep: { type: 'boolean', description: 'true = append instead of clearing' } }, async (a) => {
     const p = resolveElRef(a);
+    if (p.shadow) {
+      const r = await execJs(DEEP_TYPE_JS, [p.shadow, String(a.text ?? ''), a.keep === true]);
+      if (String(r) === 'sh-gone') throw new Error('shadow element vanished before type — re-run fx_snapshot');
+      return { ok: true, via: 'shadow', confirmed: String(r).slice(0, 120) };
+    }
     if (p.using === 'css selector') { p.value = hardenCss(p.value); await checkCss(p.value); }
     const el = await findEl(p.using, p.value);
     if (!a.keep) await M.cmd('WebDriver:ElementClear', { id: el }).catch(() => {});
     await M.cmd('WebDriver:ElementSendKeys', { id: el, text: a.text });
     return { ok: true, used: a.selector && p.value !== a.selector ? p.value : undefined };
   }),
-  T('fx_select', 'Set <select> by option value or visible label', { ref: { type: 'number' }, selector: { type: 'string' }, value: { type: 'string' }, label: { type: 'string' } }, async (a) => {
+  T('fx_select', 'Set <select> by option value or visible label (light DOM; shadow selects: use fx_field by index/label)', { ref: { type: 'number' }, selector: { type: 'string' }, value: { type: 'string' }, label: { type: 'string' } }, async (a) => {
     const mk = refMarker(a);
+    if (typeof mk === 'string' && mk.startsWith('sh:')) throw new Error('shadow-root element — the driver cannot target it; use fx_field (by index/label) or fx_click');
     const match = a.value != null
       ? `const m=[...el.options].find(o=>o.value===arguments[1]); if(!m) return 'no-option:'+arguments[1]; el.value=m.value; return 'ok:'+m.value;`
       : `const m=[...el.options].find(o=>o.textContent.trim()===arguments[1]); if(!m) return 'no-option:'+arguments[1]; el.value=m.value; return 'ok:'+m.textContent.trim();`;
     const r = await execJs(EL0 + ` if(!el) return 'el-gone'; if(el.tagName!=='SELECT') return 'not-a-select:'+(el.tagName||''); ${match} el.dispatchEvent(new Event('change',{bubbles:true})); el.dispatchEvent(new Event('input',{bubbles:true}));`, [mk, a.value != null ? a.value : a.label]);
     return { r };
   }),
-  T('fx_toggle', 'Set checkbox/radio state', { ref: { type: 'number' }, selector: { type: 'string' }, on: { type: 'boolean', description: 'default true' } }, async (a) => {
+  T('fx_toggle', 'Set checkbox/radio state (light DOM; shadow checkboxes: use fx_field by index/label or fx_click)', { ref: { type: 'number' }, selector: { type: 'string' }, on: { type: 'boolean', description: 'default true' } }, async (a) => {
     const mk = refMarker(a);
+    if (typeof mk === 'string' && mk.startsWith('sh:')) throw new Error('shadow-root element — the driver cannot target it; use fx_field (by index/label) or fx_click');
     const want = a.on !== false;
     const r = await execJs(EL0 + ` if(!el) return 'el-gone'; if(el.type!=='checkbox'&&el.type!=='radio') return 'not-togglable:'+String(el.type); if(el.checked!==arguments[1]){el.checked=arguments[1]; el.dispatchEvent(new Event('change',{bubbles:true})); el.dispatchEvent(new Event('click',{bubbles:true}));} return 'ok:'+(el.checked?'on':'off');`, [mk, want]);
     return { r };
   }),
-  T('fx_upload', 'Set a file input value (raw-path sendKeys); path must be under FX_MCP_FILE_ROOTS', { ref: { type: 'number' }, selector: { type: 'string' }, path: { type: 'string' } }, async (a) => {
+  T('fx_upload', 'Set a file input value (raw-path sendKeys; light DOM — for shadow-root file inputs, set files in-page via fx_eval); path must be under FX_MCP_FILE_ROOTS', { ref: { type: 'number' }, selector: { type: 'string' }, path: { type: 'string' } }, async (a) => {
     const abs = path.resolve(a.path);
     if (!allowedPath(abs)) throw new Error('path outside allowed roots: ' + FILE_ROOTS.join(','));
     if (!fs.existsSync(abs)) throw new Error('file not found: ' + abs);
     const p = resolveElRef(a);
+    if (p.shadow) throw new Error('shadow-root file input — the driver cannot target it; set files in-page via fx_eval (DataTransfer) or restructure the form in light DOM');
     const el = await findEl(p.using, p.value);
     await M.cmd('WebDriver:ElementSendKeys', { id: el, text: abs });
     await new Promise((r) => setTimeout(r, 700));
     const got = await execJs(EL0 + ` return el&&el.files&&el.files[0] ? el.files[0].name : 'no-file-set';`, [refMarker(a)]);
     return { uploaded: got, path: abs };
   }),
-  T('fx_form', 'Structured dump of all visible form fields on the page: index, type, label, context, value, options, files, plus aggregated choice groups (radio/checkbox sets with their question context and per-option state) — audit every required group, not just individually labeled fields. Form workflow: run fx_form first to learn the fields/groups, then set values with fx_field (by index/id/label) and answer radio/checkbox/button questions with fx_answer. Prefer these over hand-written fx_eval form scripts. Optional CSS root scopes the dump.', { root: { type: 'string', description: 'CSS selector to scope the dump (default: whole page)' }, max: { type: 'number', description: 'max fields (default 80)' } }, async (a) => {
-    const recs = await execJs(FIELD_JS, [Math.min(300, Math.max(1, Number(a.max) || 80)), 0, '', '', a.root || '']);
+  T('fx_form', 'Structured dump of all visible form fields on the page: index, type, label, context, value, options, files, plus aggregated choice groups (radio/checkbox sets with their question context and per-option state) — audit every required group, not just individually labeled fields. Crosses OPEN shadow roots by default: web-component dialogs render their fields inside shadow trees and are included (flagged sh:true). Form workflow: run fx_form first to learn the fields/groups, then set values with fx_field (by index/id/label) and answer radio/checkbox/button questions with fx_answer. Prefer these over hand-written fx_eval form scripts. Optional CSS root scopes the light-DOM dump.', { root: { type: 'string', description: 'CSS selector to scope the dump (default: whole page)' }, max: { type: 'number', description: 'max fields (default 80)' }, deep: { type: 'boolean', description: 'include fields inside open shadow roots (default true)' } }, async (a) => {
+    const recs = await execJs(FIELD_JS, [Math.min(300, Math.max(1, Number(a.max) || 80)), 0, '', '', a.root || '', a.deep !== false]);
     let arr, groups;
     if (recs && typeof recs === 'object' && Array.isArray(recs.f)) { arr = recs.f; groups = recs.g || []; }
     else if (Array.isArray(recs)) { arr = recs; groups = []; }
@@ -512,6 +697,7 @@ const TOOLS = [
         if (f.options) o.options = f.options;
         if (f.dis) o.disabled = true;
         if (f.req) o.required = true;
+        if (f.sh) o.sh = true;
         return o;
       }),
       ...(groups.length ? { groups: groups.map((g) => ({ type: g.type, name: g.name, ctx: (g.ctx || '').slice(0, 140), required: !!g.req, single: !!g.single, options: g.options.map((o) => ({ i: o.i, label: o.label, on: !!o.on })) })) } : {}),
@@ -519,7 +705,7 @@ const TOOLS = [
   }),
   T('fx_field', 'Set a form field by index (from fx_form), by id, or by label substring. Text/textarea = real keystrokes (framework-safe); checkbox/radio = real click that reaches the wanted state (pass value "on"/"off", default on) with verify + label-click + event fallbacks; select = option match by value or label. Scrolls the field into view automatically. File inputs: use fx_upload.', { index: { type: 'number', description: 'field index from fx_form' }, id: { type: 'string', description: 'field id attribute' }, label: { type: 'string', description: 'field label (substring match)' }, value: { type: 'string', description: 'text to type / option value / "on"|"off" for checkbox-radio' } }, async (a) => {
     if (a.index == null && !a.id && !a.label) throw new Error('need index (from fx_form), id, or label');
-    const recs = await execJs(FIELD_JS, [80, Number(a.index) || 0, a.id || '', (a.label || '').trim().toLowerCase(), '']);
+    const recs = await execJs(FIELD_JS, [80, Number(a.index) || 0, a.id || '', (a.label || '').trim().toLowerCase(), '', true]);
     let field;
     if (a.index != null || a.id) {
       if (!Array.isArray(recs) || !recs.length) throw new Error(a.index != null ? 'field index not found (page changed?) — run fx_form again' : 'field id not found: ' + a.id);
@@ -530,6 +716,39 @@ const TOOLS = [
       field = recs[0];
     }
     if (!field || !field.m) throw new Error('field not resolved');
+    if (String(field.m).startsWith('sh:')) {
+      // shadow-root field: set state in-page (native setter + events); the driver cannot target it
+      if (field.type === 'file') throw new Error('shadow-root file input — set files in-page via fx_eval (the driver cannot target shadow)');
+      if (field.type === 'checkbox' || field.type === 'radio') {
+        let want = true;
+        if (a.value != null) {
+          if (typeof a.value === 'boolean') want = a.value;
+          else {
+            const s = String(a.value).trim().toLowerCase();
+            if (/^(off|false|no|0)$/.test(s)) want = false;
+            else if (!/^(on|true|yes|1)$/.test(s)) throw new Error('checkbox/radio: value must be on or off (got "' + a.value + '")');
+          }
+        }
+        const curR = await execJs(DEEP_UTIL + `return (function(m){ var el=__deepResolve(arguments[0]); if(!el) return 'gone'; return String(el.checked===true); })(arguments[0]);`, [field.m]);
+        if (curR === 'gone') throw new Error('shadow field vanished before state read');
+        if ((curR === 'true') === want) return { ok: true, unchanged: true, field: fmtField(field), state: want ? 'on' : 'off', via: 'shadow' };
+        const r = await execJs(DEEP_TYPE_JS, [field.m, '', false]);
+        if (String(r) === 'sh-gone') throw new Error('shadow field vanished before click');
+        const now = String(r);
+        return { ok: want ? now === 'on' : now === 'off', field: fmtField(field), wanted: want ? 'on' : 'off', state: now, via: 'shadow' };
+      }
+      if (field.tag === 'select') {
+        if (a.value == null) throw new Error('select field: pass value (option value or visible label)');
+        const r = await execJs(DEEP_TYPE_JS, [field.m, String(a.value), false]);
+        if (String(r) === 'sh-gone') throw new Error('shadow field vanished');
+        if (String(r).startsWith('no-option:')) throw new Error('select: ' + r);
+        return { ok: true, field: fmtField(field), wanted: String(a.value), confirmed: String(r), via: 'shadow' };
+      }
+      const r = await execJs(DEEP_TYPE_JS, [field.m, a.value != null ? String(a.value) : '', false]);
+      if (String(r) === 'sh-gone') throw new Error('shadow field vanished before type');
+      const conf = String(r);
+      return { ok: a.value == null || conf === String(a.value), field: fmtField(field), confirmed: conf.slice(0, 120), via: 'shadow' };
+    }
     await execJs(EL0 + ` if(el) el.scrollIntoView({block:'center',behavior:'instant'}); return 'ok';`, [field.m]);
     await new Promise((r) => setTimeout(r, 150));
     const ref = markerRef(field.m);
@@ -592,7 +811,7 @@ const TOOLS = [
     const conf = await execJs(EL0 + ` return el?String(el.value):'gone';`, [field.m]);
     return { ok: conf !== 'gone' && (a.value == null || conf === String(a.value)), field: fmtField(field), confirmed: conf.slice(0, 120) };
   }),
-  T('fx_answer', 'Answer a grouped choice question (Yes/No button groups, radio or checkbox option groups): locate the group by matching the question text, pick the option by its label, perform a real click, then re-read and report the resulting selection state. If the target was already selected (or is still not selected) after the click — a no-op click that frameworks often do not register — performs a toggle cycle (click another option, then the target) on exclusive groups and re-verifies. If the option labels are unreadable (label-less li/label rows), it self-heals by clicking the visible wrapper whose text matches the choice. Use this instead of clicking raw button refs — option order/refs can shift on re-render, and matching by question text prevents picking the wrong option of a neighbouring question.', { question: { type: 'string', description: 'text that must appear in the question context' }, choice: { type: 'string', description: 'option label to select, e.g. "Yes" or "New York City"' }, exact: { type: 'boolean', description: 'require exact label match (default false: case-insensitive substring allowed)' } }, async (a) => {
+  T('fx_answer', 'Answer a grouped choice question (Yes/No button groups, radio or checkbox option groups): locate the group by matching the question text, pick the option by its label, perform a real click, then re-read and report the resulting selection state. If the target was already selected (or is still not selected) after the click — a no-op click that frameworks often do not register — performs a toggle cycle (click another option, then the target) on exclusive groups and re-verifies. If the option labels are unreadable (label-less li/label rows), it self-heals by clicking the visible wrapper whose text matches the choice. Searches light + open shadow DOM (shadow options are clicked in-page via the full pointer sequence). Use this instead of clicking raw button refs — option order/refs can shift on re-render, and matching by question text prevents picking the wrong option of a neighbouring question.', { question: { type: 'string', description: 'text that must appear in the question context' }, choice: { type: 'string', description: 'option label to select, e.g. "Yes" or "New York City"' }, exact: { type: 'boolean', description: 'require exact label match (default false: case-insensitive substring allowed)' } }, async (a) => {
     if (!a.question || !a.choice) throw new Error('need question + choice');
     let found0 = await execJs(ANSWER_FIND_JS, [a.question, a.choice, a.exact !== true]);
     if (!found0 || typeof found0 !== 'object' || !found0.marker) {
@@ -658,15 +877,21 @@ const TOOLS = [
     else verified = 'no selection signal on this control type — verify (e.g. re-run fx_form)';
     return { ok: state !== 'off', question: found0.ctx, answer: found0.option, pre, via, state: state === 'unreadable' ? 'unknown' : state, verified };
   }),
-  T('fx_scroll', 'Scroll an element (ref from fx_snapshot, or selector) into view so it is not obscured (e.g. by a fixed header/cookie bar), wait, and return its top coordinate. Use before clicking elements that failed as "not clickable because another element obscures it".', { ref: { type: 'number' }, selector: { type: 'string' }, pos: { type: 'string', description: 'start | center | end (default center)' }, wait_ms: { type: 'number', description: 'wait after scroll (default 400, max 2000)' } }, async (a) => {
+  T('fx_scroll', 'Scroll an element (ref from fx_snapshot, or selector) into view so it is not obscured (e.g. by a fixed header/cookie bar), wait, and return its top coordinate. Use before clicking elements that failed as "not clickable because another element obscures it". Shadow refs are scrolled in-page (reported r:"sh:ok:<top>").', { ref: { type: 'number' }, selector: { type: 'string' }, pos: { type: 'string', description: 'start | center | end (default center)' }, wait_ms: { type: 'number', description: 'wait after scroll (default 400, max 2000)' } }, async (a) => {
     const mk = refMarker(a);
+    if (typeof mk === 'string' && mk.startsWith('sh:')) {
+      const r = await execJs(DEEP_SCROLL_JS, [mk]);
+      if (r === 'sh-gone') throw new Error('shadow element not found — re-run fx_snapshot');
+      await new Promise((r3) => setTimeout(r3, Math.min(2000, Math.max(0, Number(a.wait_ms) || 400))));
+      return { r: 'sh:' + String(r) };
+    }
     const pos = a.pos === 'start' || a.pos === 'end' ? a.pos : 'center';
     const r = await execJs(EL0 + ` if(!el) return 'el-gone'; el.scrollIntoView({block:arguments[1],behavior:'instant'}); return 'ok:'+Math.round(el.getBoundingClientRect().top);`, [mk, pos]);
     if (r === 'el-gone') throw new Error('element not found');
     await new Promise((r2) => setTimeout(r2, Math.min(2000, Math.max(0, Number(a.wait_ms) || 400))));
     return { r };
   }),
-  T('fx_gates', 'Consent/attestation gate audit: lists visible checkboxes with their nearby text (flags certify/understand/agree/consent/attest/terms/privacy wording — the hidden gates of long application forms), disabled buttons (a dead Submit/Apply), and visible alert-style banners. Read-only; run it whenever a submit click does nothing or a submit button is disabled — the fix is usually an unchecked consent checkbox, not bot protection.', {}, async () => {
+  T('fx_gates', 'Consent/attestation gate audit: lists visible checkboxes with their nearby text (flags certify/understand/agree/consent/attest/terms/privacy wording — the hidden gates of long application forms), disabled buttons (a dead Submit/Apply), and visible alert-style banners. Includes open shadow-root checkboxes/buttons. Read-only; run it whenever a submit click does nothing or a submit button is disabled — the fix is usually an unchecked consent checkbox, not bot protection.', {}, async () => {
     const r = await execJs(GATES_JS, []);
     if (!r || typeof r !== 'object' || !Array.isArray(r.boxes)) throw new Error('fx_gates: unexpected page result ' + typeof r);
     const mk = (b) => ({ i: b.i, checked: !!b.checked, required: !!b.req, text: b.text, marker: b.m });
@@ -697,7 +922,7 @@ const TOOLS = [
       await new Promise((r) => setTimeout(r, 150));
     }
   }),
-  T('fx_wait', 'Wait until visible text (or CSS selector exists). Default 10s, max 30s', { text: { type: 'string' }, selector: { type: 'string' }, timeout_ms: { type: 'number' } }, async (a) => {
+  T('fx_wait', 'Wait until visible text (or CSS selector exists). Text search looks inside open shadow roots too. Default 10s, max 30s', { text: { type: 'string' }, selector: { type: 'string' }, timeout_ms: { type: 'number' } }, async (a) => {
     const ms = Math.min(30000, a.timeout_ms || 10000);
     const t0 = Date.now();
     for (;;) {
@@ -705,7 +930,7 @@ const TOOLS = [
       try {
         hit = a.selector
           ? await execJs(`return !!document.querySelector(arguments[0]);`, [a.selector])
-          : await execJs(`return document.body.innerText.indexOf(arguments[0]) >= 0;`, [a.text || '']);
+          : await execJs(`return (function(t){ function all(rt,out){ out=out||[]; out.push(rt); var els; try{els=rt.querySelectorAll('*');}catch(e){return out;} for(var i=0;i<els.length;i++){ if(els[i].shadowRoot) all(els[i].shadowRoot,out); } return out; } var roots=all(document); for(var i=0;i<roots.length;i++){ var tx=roots[i].textContent||''; if(tx.indexOf(t)>=0) return 1; } return 0; })(arguments[0]);`, [a.text || '']);
       } catch { /* keep polling */ }
       if (hit) return { ok: true, ms: Date.now() - t0 };
       if (Date.now() - t0 > ms) return { ok: false, ms: Date.now() - t0 };

@@ -136,8 +136,8 @@ function respond(id, name, params, state) {
         const v = JSON.stringify({ webdriver: false, url: 'https://fake.test/', title: 'Fake Page', ready: 'complete' });
         return [1, id, null, { value: v }];
       }
-      if (s.includes('querySelectorAll')) return [1, id, null, { value: SNAPSHOT_ROWS }];
       if (s.includes('el.files')) return [1, id, null, { value: 'upload.csv' }];
+      if (s.includes('querySelectorAll')) return [1, id, null, { value: SNAPSHOT_ROWS }];
       if (s.includes('innerText.indexOf')) return [1, id, null, { value: true }];
       if (s.includes('querySelector(arguments')) return [1, id, null, { value: true }];
       return [1, id, null, { value: 'script-ok' }];
