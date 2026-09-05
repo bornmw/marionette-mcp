@@ -5,11 +5,15 @@ import { encodeFrame, createFrameParser, frameKind } from './protocol.mjs';
 const noop = () => {};
 
 export class Marionette {
-  constructor({ host = '127.0.0.1', port = 2828, helloWaitMs = 1200, connectTimeoutMs = 60000, log = noop } = {}) {
+  constructor({ host = '127.0.0.1', port = 2828, helloWaitMs = 1200, connectTimeoutMs = 60000, commandTimeoutMs = 120000, log = noop } = {}) {
     this.host = host;
     this.port = port;
     this.helloWaitMs = helloWaitMs;
     this.connectTimeoutMs = connectTimeoutMs;
+    // Bound every in-flight command: the browser may not answer (modal dialog,
+    // mid-navigation, hung page). Without this a single never-settling command
+    // wedges the whole MCP server (commands are serialized upstream).
+    this.commandTimeoutMs = commandTimeoutMs;
     this.log = log;
     this.sock = null;
     this.parser = null;
@@ -27,7 +31,7 @@ export class Marionette {
       const s = net.connect(this.port, this.host);
       s.setTimeout(this.connectTimeoutMs);
       s.on('timeout', () => s.destroy(new Error('connect timeout')));
-      s.once('error', (e) => reject(new Error('connect: ' + e.message)));
+      s.once('error', (e) => reject(new Error('connect: ' + ((e && e.message) || e) + this._hint(e))));
       s.on('connect', () => {
         s.setTimeout(0); // cancel: no idle timeout once connected
         this.sock = s;
@@ -35,21 +39,46 @@ export class Marionette {
           onFrame: (msg) => this._onFrame(msg),
           onDrop: (reason, head) => this.log('frame dropped:', reason, head && head.toString().slice(0, 80)),
         });
-        s.on('error', (e) => this._fail('browser connection lost: ' + e.message));
-        s.on('close', () => this._fail('browser connection lost: socket closed'));
+        // Only react to events from the socket that is CURRENTLY active. A
+        // superseded socket (e.g. one we just dropped on a command-timeout
+        // poison) can emit late error/close events after we've reconnected;
+        // acting on those would destroy the fresh, healthy socket.
+        s.on('error', (e) => { if (this.sock === s) this._fail('browser connection lost: ' + e.message); });
+        s.on('close', () => { if (this.sock === s) this._fail('browser connection lost: socket closed'); });
         s.on('data', (d) => this.parser.push(d));
         resolve();
       });
     });
   }
 
+  // Actionable guidance appended to connect errors, so a port mismatch is
+  // self-explanatory: this MCP only ATTACHES to a Firefox you launched — it does
+  // not start one. Note there is NO --marionette-port CLI flag; non-default ports
+  // are set via the profile preference `marionette.port`.
+  _hint(e) {
+    const what = String((e && e.code) || (e && e.message) || e);
+    const where = this.host + ':' + this.port;
+    if (/econnrefused|refused/i.test(what)) {
+      return ' — nothing is listening on ' + where + '. Launch a dedicated Firefox with Marionette on THAT port: default port → `firefox --marionette`. Custom port → create a profile and set marionette.port=' + this.port + ' and marionette.enabled=true in its user.js (there is no --marionette-port CLI flag), then run: `firefox --marionette --no-remote -profile <that-profile>`. You can also point this MCP at an instance that is already running via fx_connect {host, port}.';
+    }
+    if (/econnreset|reset/i.test(what)) {
+      return ' — the connection to ' + where + ' dropped. The port may be busy (Marionette serves ONE active client at a time — another automation may be attached) or the browser may have restarted. Free it, or re-attach with fx_connect {host, port}.';
+    }
+    if (/timeout|ERR_SOCKET/i.test(what)) {
+      return ' — could not complete a connection to ' + where + ' in time. Check that a Marionette-enabled Firefox is actually listening on that port (see fx_status for the active endpoint).';
+    }
+    return '';
+  }
+
   _fail(msg) {
     if (!this.sock) return;
-    this.log('socket fail:', msg);
+    const s = this.sock;
+    this.sock = null;
+    this.sessionId = null;
     const pend = [...this.pending.values()];
     this.pending.clear();
-    this.sessionId = null;
-    this.sock = null;
+    this.log('socket fail:', msg);
+    try { s.destroy(); } catch { /* ignore */ }
     pend.forEach((p) => p.reject(new Error(msg)));
   }
 
@@ -79,7 +108,16 @@ export class Marionette {
     if (!this.sock || this.sock.destroyed) return Promise.reject(new Error('not connected'));
     const id = this.nextId++;
     this.sock.write(encodeFrame([0, id, name, params ?? {}]));
-    return new Promise((resolve, reject) => this.pending.set(id, { resolve, reject }));
+    return new Promise((resolve, reject) => {
+      this.pending.set(id, { resolve, reject });
+      const t = setTimeout(() => {
+        // Still pending after the bound: the command never settled. Poison the
+        // connection (reject all in-flight, destroy socket) so the next command
+        // reconnects fresh instead of continuing on a desynced stream.
+        if (this.pending.has(id)) this._fail('command timeout after ' + this.commandTimeoutMs + ' ms: ' + name);
+      }, this.commandTimeoutMs);
+      if (typeof t.unref === 'function') t.unref();
+    });
   }
 
   // Wait for the on-connect hello, then open a session.

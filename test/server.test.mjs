@@ -81,8 +81,8 @@ test('initialize returns server identity and echoes protocol version', async () 
 test('tools/list exposes the full tool table', async () => {
   const r = await rpc({ jsonrpc: '2.0', id: 2, method: 'tools/list' });
   const names = r.result.tools.map((t) => t.name);
-  assert.equal(names.length, 23, names.join(','));
-  for (const n of ['fx_status', 'fx_navigate', 'fx_snapshot', 'fx_click', 'fx_type', 'fx_select', 'fx_toggle', 'fx_upload', 'fx_form', 'fx_field', 'fx_answer', 'fx_scroll', 'fx_gates', 'fx_eval', 'fx_wait', 'fx_screenshot', 'fx_cookies']) {
+  assert.equal(names.length, 24, names.join(','));
+  for (const n of ['fx_status', 'fx_connect', 'fx_navigate', 'fx_snapshot', 'fx_click', 'fx_type', 'fx_select', 'fx_toggle', 'fx_upload', 'fx_form', 'fx_field', 'fx_answer', 'fx_scroll', 'fx_gates', 'fx_eval', 'fx_wait', 'fx_screenshot', 'fx_cookies']) {
     assert.ok(names.includes(n), 'missing tool ' + n);
   }
   for (const t of r.result.tools) {
@@ -322,6 +322,28 @@ test('notifications produce no response line', async () => {
   child.stdin.write(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' }) + '\n');
   await new Promise((r) => setTimeout(r, 400));
   assert.equal(lines.length, before);
+});
+
+test('fx_connect re-points the MCP at a different endpoint at runtime', async () => {
+  const fake2 = await startFakeMarionette();
+  try {
+    const r = await rpc({ jsonrpc: '2.0', id: 60, method: 'tools/call', params: { name: 'fx_connect', arguments: { port: fake2.port } } });
+    const o = JSON.parse(toolText(r));
+    assert.equal(o.ok, true);
+    assert.equal(o.endpoint.port, fake2.port, 'endpoint re-pointed to the new fake');
+    assert.equal(o.configured.port, fake.port, 'configured endpoint is still the original');
+    // a subsequent command must now run against the NEW endpoint
+    const r2 = await rpc({ jsonrpc: '2.0', id: 61, method: 'tools/call', params: { name: 'fx_page', arguments: {} } });
+    assert.equal(JSON.parse(toolText(r2)).url, 'https://fake.test/');
+    // non-loopback host is rejected
+    const r3 = await rpc({ jsonrpc: '2.0', id: 62, method: 'tools/call', params: { name: 'fx_connect', arguments: { host: '8.8.8.8' } } });
+    toolErr(r3, /loopback/);
+    // restore the original endpoint for any following tests
+    const r4 = await rpc({ jsonrpc: '2.0', id: 63, method: 'tools/call', params: { name: 'fx_connect', arguments: { port: fake.port } } });
+    assert.equal(JSON.parse(toolText(r4)).endpoint.port, fake.port);
+  } finally {
+    await fake2.stop();
+  }
 });
 
 test('stdin EOF terminates the server cleanly', () =>

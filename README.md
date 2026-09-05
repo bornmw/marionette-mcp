@@ -18,7 +18,7 @@ Playwright's browser-automation channels (CDP, extension mode) target Chromium, 
  AI agent (e.g. opencode)
         │  stdio · newline-delimited JSON-RPC 2.0
         ▼
- marionette-mcp (src/server.mjs)          ── tools: fx_* (22)
+  marionette-mcp (src/server.mjs)          ── tools: fx_* (24)
         │  loopback TCP · <byteLen>:<json> frames
         ▼
  your Firefox (firefox --marionette)      ── your profile, your cookies
@@ -37,7 +37,9 @@ Playwright's browser-automation channels (CDP, extension mode) target Chromium, 
 * **Marionette never awaits returned Promises.** A `return (async () => { … })()` body would serialize to `null` immediately, so `fx_eval` runs the body through a synchronous wrapper and polls `window` until the Promise settles (two-phase protocol; `wait_ms` bounds it, default 30 s).
 * **`#id` CSS selectors with digit-leading ids are invalid** (e.g. Ashby's UUID ids `#56d78818-…`). `fx_click`/`fx_type` auto-rewrite them to `[id="…"]` and report the rewrite (`used`); unsupported CSS (e.g. `:has()`) is caught in-page before the driver call with an actionable error.
 * **DOM `checked` ≠ framework form state.** Frameworks (notably Ashby) register a choice only on a real *change*. `fx_answer` therefore detects a stale pre-selected option (or an ineffective click) and runs a toggle cycle — click another option, then the target — on exclusive (radio/button) groups, re-verifying afterwards; `fx_form` aggregates radio/checkbox inputs into choice groups (question context + per-option state) so required groups can be audited in one call.
-* Marionette keeps a **persistent session across reconnects**; a crashed automation client can leave stale session state — relaunch the browser if commands queue forever.
+ * Marionette keeps a **persistent session across reconnects**; a crashed automation client can leave stale session state — relaunch the browser if commands queue forever.
+ * **A single command must always settle.** Commands are serialized and the browser's main thread can stall (modal dialog, hung navigation), so `send()` bounds every command via `FX_MCP_CMD_TIMEOUT_MS` (default 120 s). On expiry the connection is poisoned (socket destroyed, session cleared) and the next command reconnects fresh — without that, one unanswered command wedges the entire server forever.
+ * **Socket events are per-socket.** The `error`/`close` handlers only act when `this.sock === s`. A superseded socket (dropped during a command-timeout poison) can emit *late* events after we've reconnected; reacting to them would destroy the fresh, healthy socket.
 
 ## Quick start
 
@@ -48,6 +50,24 @@ firefox --marionette
 # 2. Point the MCP client (opencode) at the server
 node scripts/e2e-live.mjs        # optional: live smoke test
 ```
+
+### Matching the port (the MCP only ATTACHES — it never launches Firefox)
+
+By design nothing in this repo starts a browser: the server only *attaches* over loopback TCP to the `firefox --marionette` instance **you** launched (your profile, your cookies, your kill switch). So the browser's Marionette port must equal the MCP's port:
+
+* **Default port 2828** (both sides) → just `firefox --marionette`. No extra config needed.
+* **Custom port** → there is **no `--marionette-port` CLI flag**. Use a dedicated profile and set the port in its `user.js`:
+
+  ```bash
+  PROFILE=~/.mozilla/firefox/mcp-2829   # any dir
+  mkdir -p "$PROFILE"
+  printf 'user_pref("marionette.enabled", true);\nuser_pref("marionette.port", 2829);\n' > "$PROFILE/user.js"
+  firefox --marionette --no-remote -profile "$PROFILE"
+  ```
+
+  Then point the MCP at it via `FX_MARIONETTE_PORT` (opencode config) — or, if the MCP is already running, re-point it at runtime with `fx_connect {host, port}` (no restart needed).
+
+* **Verify / diagnose:** `fx_status` reports both the **active `endpoint`** and the **`configured`** endpoint. If it can't connect, the error names the port it tried and how to launch Firefox there (e.g. `ECONNREFUSED 127.0.0.1:2829` → nothing listening; launch as above). Remember Marionette serves **one active client per browser** — don't leave another marionette-mcp (or another automation) attached to the same instance.
 
 opencode config (opencode.json):
 
@@ -81,7 +101,8 @@ Form-tool gotchas (from live ATS/portal forms): re-renders can silently drop che
 
 | Tool | Purpose |
 |---|---|
-| `fx_status` | Connection, session, current page, `navigator.webdriver` |
+| `fx_status` | Connection, active **`endpoint`** vs `configured`, session, current page, `navigator.webdriver` |
+| `fx_connect` | (Re-)point the MCP at a loopback endpoint `{host, port}` and re-attach (env-configured default when omitted). Returns the active endpoint, the configured one, and the session. Use it to target a dedicated instance without restarting the client. |
 | `fx_navigate` | Go to a URL |
 | `fx_page` | Current URL + title |
 | `fx_snapshot` | Interactive-element map with refs (incl. visible `label` text when present) |
@@ -107,8 +128,9 @@ Form-tool gotchas (from live ATS/portal forms): re-renders can silently drop che
 | Variable | Default | Meaning |
 |---|---|---|
 | `FX_MARIONETTE_HOST` | `127.0.0.1` | Marionette endpoint (loopback only, by design) |
-| `FX_MARIONETTE_PORT` | `2828` | Firefox's `--marionette` port |
+| `FX_MARIONETTE_PORT` | `2828` | Firefox's `--marionette` port (must match the browser you launch; `fx_status` shows the active endpoint). Override at runtime with `fx_connect {port}` |
 | `FX_MCP_FILE_ROOTS` | `/tmp` | Comma-separated roots that `fx_upload`/`fx_screenshot` may touch |
+| `FX_MCP_CMD_TIMEOUT_MS` | `120000` | Per-command bound. A command that never settles (modal dialog, hung page) poisons the connection and auto-reconnects on the next command, so one stuck page can't wedge the whole server |
 
 ## Security
 

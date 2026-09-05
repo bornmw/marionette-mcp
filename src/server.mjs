@@ -22,7 +22,7 @@ try {
   VERSION = JSON.parse(fs.readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version || VERSION;
 } catch { /* dev checkouts without package.json */ }
 
-const M = new Marionette({ host: HOST, port: PORT, log });
+const M = new Marionette({ host: HOST, port: PORT, commandTimeoutMs: Number(process.env.FX_MCP_CMD_TIMEOUT_MS || 120000), log });
 let snapshotRefs = [];
 
 // ---------------- element helpers ----------------
@@ -607,9 +607,35 @@ function fmtField(f) {
 const T = (name, desc, schema, fn) => ({ name, description: desc, inputSchema: { type: 'object', properties: schema, additionalProperties: false }, fn });
 
 const TOOLS = [
-  T('fx_status', 'Health: connection, session, current page, navigator.webdriver flag', {}, async () => {
+  T('fx_status', 'Health: connection, session, active + configured endpoint, current page, navigator.webdriver flag', {}, async () => {
     const pi = await pageInfo();
-    return { connected: true, protocol: M.hello && M.hello.marionetteProtocol, session: M.sessionId, ...pi };
+    return {
+      connected: true,
+      endpoint: { host: M.host, port: M.port },
+      configured: { host: HOST, port: PORT },
+      protocol: M.hello && M.hello.marionetteProtocol,
+      session: M.sessionId,
+      ...pi,
+    };
+  }),
+  T('fx_connect', 'Point the MCP at a Firefox endpoint (host/port) and (re)attach. Marionette serves ONE client per browser, so use a dedicated instance per automation — the env-configured default (FX_MARIONETTE_HOST/PORT) is used when both args are omitted. Loopback only (by design). Returns the active endpoint + session after (re)attach.', { host: { type: 'string', description: 'loopback host, default 127.0.0.1' }, port: { type: 'number', description: 'marionette port, default = configured env port' } }, async (a) => {
+    if (a.host !== undefined) {
+      const h = String(a.host);
+      if (!/^(127\.\d{1,3}\.\d{1,3}\.\d{1,3}|localhost|::1)$/.test(h)) throw new Error('host must be loopback (127.x / localhost / ::1)');
+      M.host = h;
+    }
+    if (a.port !== undefined) {
+      const p = Number(a.port);
+      if (!Number.isInteger(p) || p < 1 || p > 65535) throw new Error('port must be an integer 1..65535');
+      M.port = p;
+    }
+    if (M.sock && !M.sock.destroyed) { try { M.sock.destroy(); } catch { /* ignore */ } }
+    M.sock = null;
+    M.sessionId = null;
+    M.pending.clear();
+    connected = false;
+    await ensureConn();
+    return { ok: true, endpoint: { host: M.host, port: M.port }, configured: { host: HOST, port: PORT }, session: M.sessionId, protocol: M.hello && M.hello.marionetteProtocol };
   }),
   T('fx_navigate', 'Navigate the active tab to a URL', { url: { type: 'string' } }, async (a) => {
     await M.cmd('WebDriver:Navigate', { url: a.url });
@@ -986,6 +1012,11 @@ function toolResult(payload) {
   if (payload && typeof payload === 'object' && !Array.isArray(payload) && typeof payload.text !== 'string') {
     return { content: [{ type: 'text', text: JSON.stringify(payload, null, 1) }], isError: false };
   }
+  // A pure {text: <string>} wrapper (e.g. fx_alert_state) carries its content in
+  // `text` — String(payload) would render "[object Object]" and lose it.
+  if (payload && typeof payload === 'object' && !Array.isArray(payload) && typeof payload.text === 'string' && Object.keys(payload).length === 1) {
+    return { content: [{ type: 'text', text: payload.text }], isError: false };
+  }
   return { content: [{ type: 'text', text: String(payload ?? '') }], isError: false };
 }
 
@@ -1008,9 +1039,11 @@ async function handle(obj) {
     } else if (method === 'tools/call') {
       const tool = TOOLS.find((t) => t.name === params.name);
       if (!tool) throw new Error('unknown tool: ' + params.name);
-      await ensureConn();
+      if (tool.name !== 'fx_connect') await ensureConn(); // fx_connect manages its own (re)connect
       const payload = await tool.fn(params.arguments || {});
       result = toolResult(payload);
+    } else if (typeof method === 'string' && method.startsWith('notifications/')) {
+      result = null; // client notification (e.g. notifications/initialized) — acknowledge, no response
     } else {
       throw new Error('unsupported method: ' + method);
     }

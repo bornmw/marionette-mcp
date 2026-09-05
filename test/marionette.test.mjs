@@ -1,6 +1,7 @@
 // marionette.test.mjs — Marionette client against the fake wire-protocol server.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import net from 'node:net';
 import { Marionette } from '../src/marionette.mjs';
 import { startFakeMarionette } from './helpers/fake_marionette.mjs';
 
@@ -74,6 +75,44 @@ test('socket loss rejects in-flight command', async () => {
     if (m.sock && !m.sock.destroyed) m.sock.destroy();
     await fake.stop();
   }
+});
+
+test('command timeout: a never-answered command rejects, poisons, then auto-reconnects', async () => {
+  const fake = await startFakeMarionette();
+  const m = new Marionette({ port: fake.port, helloWaitMs: 50, commandTimeoutMs: 300, log: () => {} });
+  try {
+    await m.connect();
+    await m.init();
+    assert.ok(m.sessionId, 'started with a live session');
+    fake.state.hang = true; // the "browser" now never answers
+    const t0 = Date.now();
+    await assert.rejects(m.send('WebDriver:GetTitle'), /command timeout/);
+    assert.ok(Date.now() - t0 >= 250, 'timeout should fire near commandTimeoutMs');
+    assert.ok(!m.sock || m.sock.destroyed, 'socket destroyed after timeout');
+    assert.equal(m.sessionId, null, 'session cleared after timeout');
+    fake.state.hang = false;
+    const title = await m.cmd('WebDriver:GetTitle'); // auto-reconnects fresh
+    assert.equal(title.value, 'Fake Page');
+    assert.ok(m.sessionId, 'reconnected with a fresh session');
+  } finally {
+    if (m.sock && !m.sock.destroyed) m.sock.destroy();
+    await fake.stop();
+  }
+});
+
+test('connect() to a closed port yields an actionable launch hint', async () => {
+  // grab a definitely-free loopback port, then release it
+  const probe = net.createServer();
+  await new Promise((r) => probe.listen(0, '127.0.0.1', r));
+  const port = probe.address().port;
+  await new Promise((r) => probe.close(r));
+  await new Promise((r) => setTimeout(r, 50)); // let the listener fully free the port
+  const m = new Marionette({ host: '127.0.0.1', port, helloWaitMs: 20, log: () => {} });
+  await assert.rejects(m.connect(), (e) => {
+    assert.match(e.message, /nothing is listening on 127\.0\.0\.1:/);
+    assert.ok(e.message.includes('marionette.port=' + port), 'hint explains how to set the custom port: ' + e.message);
+    return true;
+  });
 });
 
 test('send() without a socket rejects cleanly', async () => {

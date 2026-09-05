@@ -43,6 +43,7 @@ export function startFakeMarionette() {
         let msg = null;
         try { msg = JSON.parse(body.toString('utf8')); } catch { state.violations.push('bad-json'); continue; }
         state.frames.push(msg);
+        if (state.hang) return; // simulate a command the browser never answers (wedge test)
         const [, id, name, params] = msg;
         try {
           const reply = JSON.stringify(respond(id, name, params, state));
